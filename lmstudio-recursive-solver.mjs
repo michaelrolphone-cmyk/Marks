@@ -1,1227 +1,1413 @@
 #!/usr/bin/env node
 /**
- * lmstudio-recursive-solver.mjs
+ * solver.js — LM Studio “tool + solver” agent that can run:
+ *   1) one-shot CLI: node solver.js "question" [flags]
+ *   2) listen mode (WS control client): node solver.js --listen [flags]
  *
- * Recursive planner/solver using LM Studio + OPTIONAL SURVEY-CAD API actions.
+ * IMPORTANT:
+ * - This file is written as an ES module. If your Node project is not ESM
+ *   (no `"type":"module"` in package.json), rename this file to `solver.mjs`.
  *
- * LM Studio:
- *   - OpenAI-compatible server, default: http://localhost:1234/v1
- *
- * SURVEY-CAD API (remote):
- *   - default: https://record-of-survey-795c317ace89.herokuapp.com
- *
- * Capabilities:
- *  1) Ask LLM to decompose problem into tasks
- *  2) Recursively solve tasks; break down tasks when needed
- *  3) Reflect + revise plan when wrong path detected
- *  4) Persist state.json (resume supported)
- *  5) NEW: LLM may request HTTP calls to your API via an `actions` array
- *
- * Usage:
- *   node lmstudio-recursive-solver.mjs "Your problem here"
- *   node lmstudio-recursive-solver.mjs --stdin
- *   node lmstudio-recursive-solver.mjs --resume ./runs/run-.../state.json
- *
- * LM Studio options:
- *   --base-url <url>      (default: http://localhost:1234/v1)
- *   --model <name>        (default: local-model)
- *
- * API options:
- *   --api-base-url <url>  (default: https://record-of-survey-795c317ace89.herokuapp.com)
- *   --allow-write         allow POST/PUT/PATCH/DELETE to allowlisted endpoints
- *   --allow-write-any     allow writes to ANY path (dangerous)
- *   --api-timeout-ms <n>  default 45000
- *
- * Control:
- *   --temperature <num>   (default: 0.2)
- *   --max-depth <n>       (default: 4)
- *   --max-steps <n>       (default: 50)  root loop (task picks)
- *   --max-llm-calls <n>   (default: 200) total LLM calls budget
- *   --max-actions <n>     (default: 40)  total API actions budget
- *   --max-actions-per-turn <n> (default: 4)  actions per solver turn
- *   --max-turns-per-task <n>   (default: 6)  solver inner loop
- *
- * Output:
- *   --out <dir>           (default: ./runs/run-YYYY-MM-DD_HHMMSS)
- *   --state <file>        (default: <out>/state.json)
- *
- * Helpers:
- *   --list-models         list LM Studio models
- *   --stdin               read problem from stdin
- *   --no-revise           disable plan revision
+ * No environment variables are required. Edit the CONFIG blob below.
  */
 
-import fs from "node:fs";
-import fsp from "node:fs/promises";
-import path from "node:path";
+import os from "node:os";
 import process from "node:process";
-import crypto from "node:crypto";
+import { randomUUID } from "node:crypto";
+import WebSocket from "ws";
 
-const DEFAULTS = {
-  baseUrl: "http://localhost:1234/v1",
-  model: "local-model",
-  temperature: 0.2,
+/* =========================
+   CONFIG (EDIT THIS BLOB)
+   ========================= */
+const CONFIG = {
+  control: {
+    // WS endpoint on your server that sends {type:"chat"} jobs.
+    // Example: "wss://record-of-survey-795c317ace89.herokuapp.com/ws/lmproxy"
+    wsUrl: "wss://record-of-survey-795c317ace89.herokuapp.com/ws/lmproxy",
+    // Optional shared secret (sent as header x-control-token)
+    token: ""
+  },
 
-  // Recursive controls
-  maxDepth: 4,
-  maxSteps: 50,
+  lm: {
+    // LM Studio OpenAI-compatible base URL (MUST include /v1)
+    baseUrl: "http://127.0.0.1:1234/v1",
+    // LM Studio typically doesn’t need a key; leave empty unless you use one
+    apiKey: ""
+  },
 
-  // Budgeting
-  maxLlmCalls: 200,
-  maxActions: 40,
-  maxActionsPerTurn: 4,
-  maxTurnsPerTask: 6,
+  api: {
+    // Your SURVEY-CAD server base URL (https://record-of-survey-...herokuapp.com)
+    baseUrl: "https://record-of-survey-795c317ace89.herokuapp.com",
+    // Presence WS path on that server (per your browser app)
+    crewPresenceWsPath: "/ws/crew-presence",
+    // Optional: if your presence WS expects a token, include it here (sent as query param ?token=)
+    presenceToken: ""
+  },
 
-  allowRevise: true,
+  defaults: {
+    model: "local-model",
+    temperature: 0.2,
+    maxTokens: 900,
+    stream: true,
 
-  // SURVEY-CAD API
-  apiBaseUrl: "https://record-of-survey-795c317ace89.herokuapp.com",
-  apiTimeoutMs: 45000,
-  allowWrite: false,
-  allowWriteAny: false,
+    // safety gate for HTTP writes (POST/PUT/PATCH/DELETE)
+    allowWrite: false,
+
+    // retry behavior when tool calls fail
+    toolRepairRounds: 3,
+
+    // solver decomposition depth
+    solverMaxSteps: 6,
+    solverMaxReplans: 2
+  },
+
+  timeouts: {
+    httpMs: 20_000,
+    presenceWsMs: 6_000
+  },
+
+  logLevel: "info" // debug|info|warn|error
 };
 
-// Allowlisted write endpoints (only used when --allow-write is set)
-const WRITE_ALLOWLIST = new Set([
-  "/api/localstorage-sync",
-  "/api/project-file/compile",
-  "/extract",
-]);
+/* =========================
+   API REFERENCE (embedded for the LLM)
+   ========================= */
+const API_REFERENCE = String.raw`
+# SURVEY-CAD API (embedded reference)
 
-function nowStamp() {
-  const d = new Date();
-  const pad = (n) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
-}
-function uid(prefix = "T") {
-  return `${prefix}${crypto.randomBytes(4).toString("hex").toUpperCase()}`;
-}
-function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+Base URL: ${CONFIG.api.baseUrl}
 
-function parseArgs(argv) {
-  const args = { _: [] };
-  for (let i = 2; i < argv.length; i++) {
-    const a = argv[i];
-    if (!a.startsWith("--")) { args._.push(a); continue; }
-    const key = a.slice(2);
-    const hasValue = (i + 1 < argv.length) && !argv[i + 1].startsWith("--");
-    if (key === "stdin" || key === "list-models" || key === "no-revise" || key === "allow-write" || key === "allow-write-any") {
-      args[key] = true;
-    } else if (hasValue) {
-      args[key] = argv[++i];
-    } else {
-      args[key] = true;
+API Endpoint Catalog (LLM-friendly, zero-ambiguity)
+
+Base URL: [http://localhost:3000](http://localhost:3000)
+Rule of thumb: If you start with an address, prefer /api/lookup (the address hub), then fan out to parcel/PLSS/subdivision/map. If you start with lat/lon, go straight to the lat/lon endpoints.
+
+HEALTH
+
+* GET /health -> { ok: true }
+  Purpose: Liveness probe / “is the server up?” check.
+  Use when: boot verification, monitoring, debugging networking/proxy issues.
+  Inputs: none
+  Output you rely on: ok (boolean)
+  Next: if ok=true, call /api/apps or your workflow endpoint.
+
+APPS
+
+* GET /api/apps
+  Purpose: Returns the catalog of available browser tools/apps and their entry paths.
+  Use when: rendering a launcher UI, confirming what tools are deployed, feature discovery.
+  Inputs: none
+  Outputs you rely on (typical): app list entries containing a browser path/URL and display metadata.
+  Next: open returned app paths in a browser OR choose endpoints below.
+
+GEOSPATIAL (Address ↔ Coordinate ↔ Parcel/PLSS/Subdivision/Map)
+Core decision:
+
+* If you have an address: start with GET /api/lookup?address=... (preferred).
+
+* If you only need a coordinate: use GET /api/geocode?address=....
+
+* GET /api/geocode?address=...
+  Purpose: Convert an address string into lat/lon only.
+  Goal(s): “Turn an address into coordinates.”
+  Inputs (required): address (string)
+  Outputs you rely on: lat and lon (or location.lat / location.lon)
+  Next (common): Use returned lat/lon with /api/parcel, /api/section, /api/aliquots, /api/subdivision, /api/static-map.
+
+* GET /api/lookup?address=...
+  Purpose: Address -> “survey context” lookup (preferred address entrypoint).
+  Goal(s): “Address -> everything needed to drive downstream survey context.”
+  Inputs (required): address (string)
+  Outputs you rely on: lat and lon (plus any normalized address/context metadata if present)
+  Next (typical fan-out using returned lat/lon):
+
+  * /api/parcel?lon=...&lat=... to get parcel polygon
+  * /api/section?lon=...&lat=... to get PLSS section
+  * /api/aliquots?lon=...&lat=... to get aliquot polygons
+  * /api/subdivision?lon=...&lat=... to get subdivision boundary/name
+  * /api/static-map?lon=...&lat=...&address=... to get a quick map snapshot
+
+* GET /api/parcel?lon=...&lat=...&outSR=4326&searchMeters=40
+  Purpose: Find the parcel near a coordinate and return parcel geometry/attributes.
+  Goal(s): “Get parcel polygon near this coordinate.”
+  Inputs (required): lon, lat (numbers)
+  Inputs (optional defaults): outSR=4326, searchMeters=40
+  Outputs you rely on: parcel geometry (polygon) + parcel identifier/attributes (implementation-specific)
+  Next (common): Overlay with /api/subdivision and /api/utilities; produce a map snapshot via /api/static-map.
+
+* GET /api/section?lon=...&lat=...
+  Purpose: Return the PLSS section containing the coordinate (Township/Range/Section context).
+  Goal(s): “Which PLSS section is this point in?”
+  Inputs (required): lon, lat
+  Outputs you rely on: township/range/section fields (names implementation-specific)
+  Next: /api/aliquots?lon=...&lat=... to get quarter/aliquot polygons.
+
+* GET /api/aliquots?lon=...&lat=...&outSR=4326
+  Purpose: Return aliquot polygons/labels for the coordinate’s PLSS context.
+  Goal(s): “Get aliquot polygons/labels for PLSS overlays and indexing.”
+  Inputs (required): lon, lat
+  Inputs (optional default): outSR=4326
+  Outputs you rely on: aliquot list with label + geometry (polygons) (field names may vary)
+  Next: Render polygons; derive index labels; combine with /api/section.
+
+* GET /api/subdivision?lon=...&lat=...&outSR=4326
+  Purpose: Identify subdivision near a coordinate and return subdivision boundary/metadata.
+  Goal(s): “Find subdivision boundary/name near coordinate.”
+  Inputs (required): lon, lat
+  Inputs (optional default): outSR=4326
+  Outputs you rely on: subdivision geometry + subdivision name (if available)
+  Next: Overlay with parcel + utilities; attach subdivision name to project metadata.
+
+* GET /api/static-map?lon=...&lat=...&address=...
+  Purpose: Generate/return a static map representation for a location.
+  Goal(s): “Get a quick map snapshot for display/export.”
+  Inputs (required): lon, lat
+  Inputs (optional): address (string label)
+  Outputs you rely on: either an image response (png/jpg) OR a JSON payload containing a URL (implementation-specific)
+  Next: Embed in UI; store as a resource in a project bundle.
+
+UTILITIES
+
+* GET /api/utilities?address=...&outSR=2243&sources=power,water
+  Purpose: Fetch utility-related records/maps for an address and return geometry in a target spatial reference for export/overlay.
+  Goal(s): “Fetch power/water utility records for an address.”
+  Inputs (required): address (string)
+  Inputs (optional default): outSR=2243
+  Inputs (required for coverage): sources (comma-separated list like power,water)
+  Outputs you rely on: list of utility records with geometry + attributes (field names vary)
+  Next: Export to CSV/points; render overlays; attach to project resources.
+
+PROJECT
+
+* GET /api/project-file/template?projectName=...&client=...&address=...&resources=[...]
+  Purpose: Create a starter project-file JSON template from basic metadata and optional resources.
+  Goal(s): “Generate a project template / prefill project editor.”
+  Inputs (required): projectName, client, address (strings)
+  Inputs (optional): resources (JSON array encoded in query string)
+  Outputs you rely on: a projectFile template object (field name may vary)
+  Next: POST /api/project-file/compile to compile/normalize the project.
+
+* POST /api/project-file/compile (body: {projectFile:{...}} or {project:{...}})
+  Purpose: Compile/normalize a project object into canonical project output (often including an archive plan).
+  Goal(s): “Finalize project file and generate bundle plan.”
+  Inputs (required): JSON body containing either projectFile or project
+  Outputs you rely on: compiled project file + (often) archive plan (implementation-specific)
+  Next: Save compiled project; execute archive plan actions as needed.
+
+FIELD-TO-FINISH
+
+* GET /api/fld-config?file=config/MLS.fld
+  Purpose: Parse an .fld config and return rules usable by LineSmith (code -> linework/symbol behavior).
+  Goal(s): “Load field-to-finish rules for drafting/auto-linework.”
+  Inputs (required): file (server-readable path string)
+  Outputs you rely on: rules, rulesByCode, columns, versionTag (names may vary)
+  Next: Apply rules in drafting UI; drive code parsing and symbol mapping.
+
+LOCALSTORAGE SYNC (REST)
+
+* GET /api/localstorage-sync
+  Purpose: Fetch authoritative shared snapshot/version/checksum for browser localStorage-backed app state.
+  Goal(s): “Bootstrap new client” “Recover from checksum mismatch” “Fallback sync when WS down.”
+  Inputs: none
+  Outputs you rely on: snapshot, version, checksum
+  Next: Connect WS /ws/localstorage-sync for diff-based realtime updates; on mismatch, re-fetch and rebase.
+
+* POST /api/localstorage-sync (body: {version:number, snapshot:object})
+  Purpose: Publish a full snapshot (bootstrap / fallback sync write path).
+  Goal(s): “Force publish state” “Fallback publish when WS unavailable.”
+  Inputs (required): version (number), snapshot (object)
+  Outputs you rely on: success indicator + updated checksum/version (implementation-specific)
+  Next: Reconnect WS and resume diffs.
+
+ROS/OCR
+
+* POST /extract
+  Purpose: Run ROS/plat OCR extraction.
+  Goal(s): “Extract text + geometry-like primitives (bearings/distances/symbol crops/etc.).”
+  Inputs: implementation-specific (file upload or JSON job spec)
+  Outputs you rely on: extracted text/features (implementation-specific)
+  Next: Save extracted JSON/SVG outputs; feed results into drafting/linework pipeline.
+
+* GET /api/ros-pdf?url=...
+  Purpose: Proxy/fetch remote PDF for processing (avoid browser CORS and enable server-side OCR pipeline).
+  Goal(s): “Fetch a PDF by URL so it can be processed.”
+  Inputs (required): url (string)
+  Outputs you rely on: PDF bytes (or an error)
+  Next: Run /extract using the fetched PDF (by bytes or stored reference depending on implementation).
+
+WEBSOCKETS
+
+* WS GET /ws/localstorage-sync (diff sync)
+  Purpose: Real-time differential synchronization of localStorage state across tabs/devices.
+  Goal(s): “Keep multiple browsers/devices converged on the same app state.”
+  Client responsibilities:
+
+  * Wrap localStorage writes into diffs (set/remove/clear)
+  * Send diffs with a base checksum
+  * Apply server broadcast diffs and verify checksum
+  * Recover via GET /api/localstorage-sync when checksum mismatches
+    Next: none; this is the live channel.
+
+* WS GET /ws/lineforge?room=... (collab)
+  Purpose: Live collaboration for drafting apps (LineSmith/ArrowHead): shared state, optimistic concurrency acks, edit locks, peer updates.
+  Goal(s): “Multi-user shared editing for drawings.”
+  Inputs (required): room (string)
+  Outputs you rely on: state updates + ack/reject + lock messages (exact schema implementation-specific)
+  Next: none; this is the live channel.
+
+* WS GET /ws/crew-presence (presence)
+  Purpose: Presence-only channel: track online crew members.
+  Goal(s): “Who is online?”
+  Inputs: none
+  Server -> client messages:
+
+  * {type:'crew-presence-welcome', online:[crewMemberId,...]}
+  * {type:'crew-presence-update',  online:[crewMemberId,...]}
+    Next: map IDs to names if needed (see below).
+
+NOTES FOR “HUMAN READABLE” OUTPUTS
+
+* Presence returns crewMemberId UUIDs only. To display names, map UUID -> crew profile.
+  If your wider platform provides a crew directory endpoint (commonly GET /api/crew), use it to build an id->displayName map.
+  Do not assume /api/crew exists unless this deployment explicitly includes it.
+
+`;
+
+/* =========================
+   Utilities
+   ========================= */
+
+function log(level, ...args) {
+  const order = { debug: 10, info: 20, warn: 30, error: 40 };
+  const cur = order[String(CONFIG.logLevel || "info")] ?? 20;
+  const lvl = order[level] ?? 20;
+  if (lvl < cur) return;
+  // eslint-disable-next-line no-console
+  console[level](...args);
+}
+
+function die(msg) {
+  console.error(msg);
+  process.exit(1);
+}
+
+function safeJsonParse(s) {
+  try {
+    return { ok: true, value: JSON.parse(s) };
+  } catch (e) {
+    return { ok: false, error: e };
+  }
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function clamp(n, lo, hi) {
+  return Math.max(lo, Math.min(hi, n));
+}
+
+function normalizePath(p) {
+  const s = String(p || "");
+  if (!s) return "/";
+  return s.startsWith("/") ? s : `/${s}`;
+}
+
+function stripTrailingSlashes(s) {
+  return String(s || "").replace(/\/+$/, "");
+}
+
+function joinUrl(base, path) {
+  return stripTrailingSlashes(base) + normalizePath(path);
+}
+
+function buildWsUrlFromHttp(httpBaseUrl, wsPath, queryObj = null) {
+  const u = new URL(httpBaseUrl);
+  u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
+  u.pathname = normalizePath(wsPath);
+  u.search = "";
+  if (queryObj && typeof queryObj === "object") {
+    for (const [k, v] of Object.entries(queryObj)) {
+      if (v === undefined || v === null || v === "") continue;
+      u.searchParams.set(k, String(v));
     }
   }
-  return args;
+  return u.toString();
 }
 
-async function readStdinAll() {
-  return new Promise((resolve) => {
-    let data = "";
-    process.stdin.setEncoding("utf8");
-    process.stdin.on("data", (c) => data += c);
-    process.stdin.on("end", () => resolve(data));
-  });
+function isWriteMethod(m) {
+  const method = String(m || "GET").toUpperCase();
+  return method === "POST" || method === "PUT" || method === "PATCH" || method === "DELETE";
 }
 
-function logInfo(msg) { console.log(`\x1b[36m[i]\x1b[0m ${msg}`); }
-function logOk(msg) { console.log(`\x1b[32m[✓]\x1b[0m ${msg}`); }
-function logWarn(msg) { console.log(`\x1b[33m[!]\x1b[0m ${msg}`); }
-function logErr(msg) { console.error(`\x1b[31m[x]\x1b[0m ${msg}`); }
-
-function ensureDirSync(dir) {
-  fs.mkdirSync(dir, { recursive: true });
+function truncate(obj, maxChars = 9000) {
+  const s = typeof obj === "string" ? obj : JSON.stringify(obj, null, 2);
+  if (s.length <= maxChars) return s;
+  return s.slice(0, maxChars) + `\n…(truncated ${s.length - maxChars} chars)`;
 }
 
-function truncateForModel(x, limit = 9000) {
-  const s = typeof x === "string" ? x : JSON.stringify(x, null, 2);
-  if (s.length <= limit) return s;
-  return s.slice(0, limit) + `\n…(truncated ${s.length - limit} chars)…`;
+function extractLikelyJson(text) {
+  const s = String(text || "").trim();
+  if (!s) return null;
+  const first = s.indexOf("{");
+  const last = s.lastIndexOf("}");
+  if (first === -1 || last === -1 || last <= first) return null;
+  const candidate = s.slice(first, last + 1);
+  const parsed = safeJsonParse(candidate);
+  if (parsed.ok) return parsed.value;
+  return null;
 }
 
-function tryExtractJson(text) {
-  const s = String(text ?? "");
-  const firstObj = s.indexOf("{");
-  const firstArr = s.indexOf("[");
-  let start = -1;
-  if (firstObj === -1) start = firstArr;
-  else if (firstArr === -1) start = firstObj;
-  else start = Math.min(firstObj, firstArr);
+/* =========================
+   CLI Args (override CONFIG)
+   ========================= */
 
-  if (start === -1) throw new Error("No JSON start found in model output.");
+function parseArgs(argv) {
+  const out = {
+    prompt: null,
 
-  const open = s[start];
-  const close = open === "{" ? "}" : "]";
-  let depth = 0;
-  let inStr = false;
-  let esc = false;
+    listen: false,
 
-  for (let i = start; i < s.length; i++) {
-    const ch = s[i];
-    if (inStr) {
-      if (esc) { esc = false; continue; }
-      if (ch === "\\") { esc = true; continue; }
-      if (ch === '"') inStr = false;
+    baseUrl: CONFIG.lm.baseUrl,
+    model: CONFIG.defaults.model,
+    lmApiKey: CONFIG.lm.apiKey,
+
+    apiBaseUrl: CONFIG.api.baseUrl,
+    crewPresenceWsPath: CONFIG.api.crewPresenceWsPath,
+    presenceToken: CONFIG.api.presenceToken,
+
+    controlWsUrl: CONFIG.control.wsUrl,
+    controlToken: CONFIG.control.token,
+
+    temperature: CONFIG.defaults.temperature,
+    maxTokens: CONFIG.defaults.maxTokens,
+    stream: CONFIG.defaults.stream,
+
+    allowWrite: CONFIG.defaults.allowWrite,
+
+    toolRepairRounds: CONFIG.defaults.toolRepairRounds,
+    httpTimeoutMs: CONFIG.timeouts.httpMs,
+    presenceTimeoutMs: CONFIG.timeouts.presenceWsMs,
+
+    solverMaxSteps: CONFIG.defaults.solverMaxSteps,
+    solverMaxReplans: CONFIG.defaults.solverMaxReplans
+  };
+
+  const positional = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (!a.startsWith("--")) {
+      positional.push(a);
       continue;
-    } else {
-      if (ch === '"') { inStr = true; continue; }
-      if (ch === open) depth++;
-      if (ch === close) depth--;
-      if (depth === 0) {
-        const candidate = s.slice(start, i + 1);
-        return JSON.parse(candidate);
+    }
+
+    const key = a.slice(2);
+    const next = argv[i + 1];
+    const hasValue = next !== undefined && !String(next).startsWith("--");
+
+    const val = hasValue ? next : null;
+    if (hasValue) i++;
+
+    switch (key) {
+      case "listen":
+        out.listen = true;
+        break;
+
+      case "base-url":
+        out.baseUrl = String(val || out.baseUrl);
+        break;
+
+      case "model":
+        out.model = String(val || out.model);
+        break;
+
+      case "lm-api-key":
+        out.lmApiKey = String(val || out.lmApiKey);
+        break;
+
+      case "api-base-url":
+        out.apiBaseUrl = String(val || out.apiBaseUrl);
+        break;
+
+      case "crew-presence-path":
+        out.crewPresenceWsPath = String(val || out.crewPresenceWsPath);
+        break;
+
+      case "presence-token":
+        out.presenceToken = String(val || out.presenceToken);
+        break;
+
+      case "control-ws-url":
+        out.controlWsUrl = String(val || out.controlWsUrl);
+        break;
+
+      case "control-token":
+        out.controlToken = String(val || out.controlToken);
+        break;
+
+      case "temperature":
+        out.temperature = clamp(Number(val ?? out.temperature), 0, 2);
+        break;
+
+      case "max-tokens":
+        out.maxTokens = clamp(Number(val ?? out.maxTokens), 64, 8192);
+        break;
+
+      case "no-stream":
+        out.stream = false;
+        break;
+
+      case "allow-write":
+        out.allowWrite = true;
+        break;
+
+      case "tool-repair-rounds":
+        out.toolRepairRounds = clamp(Number(val ?? out.toolRepairRounds), 0, 10);
+        break;
+
+      case "http-timeout-ms":
+        out.httpTimeoutMs = clamp(Number(val ?? out.httpTimeoutMs), 1000, 120000);
+        break;
+
+      case "presence-timeout-ms":
+        out.presenceTimeoutMs = clamp(Number(val ?? out.presenceTimeoutMs), 1000, 60000);
+        break;
+
+      case "solver-max-steps":
+        out.solverMaxSteps = clamp(Number(val ?? out.solverMaxSteps), 1, 20);
+        break;
+
+      case "solver-max-replans":
+        out.solverMaxReplans = clamp(Number(val ?? out.solverMaxReplans), 0, 10);
+        break;
+
+      default:
+        // ignore unknown flags
+        break;
+    }
+  }
+
+  if (positional.length) out.prompt = positional.join(" ").trim();
+  return out;
+}
+
+/* =========================
+   LM Studio client (OpenAI-compatible)
+   ========================= */
+
+function lmHeaders(apiKey) {
+  const h = { "content-type": "application/json" };
+  if (apiKey) h["authorization"] = `Bearer ${apiKey}`;
+  return h;
+}
+
+async function streamSse(resp, onData, signal) {
+  const reader = resp.body?.getReader?.();
+  if (!reader) throw new Error("No readable stream body (Node/Fetch streaming not available).");
+
+  const decoder = new TextDecoder("utf-8");
+  let buf = "";
+
+  while (true) {
+    if (signal?.aborted) throw Object.assign(new Error("cancelled"), { name: "AbortError" });
+
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+
+    let split;
+    while ((split = buf.indexOf("\n\n")) !== -1) {
+      const block = buf.slice(0, split);
+      buf = buf.slice(split + 2);
+
+      for (const line of block.split("\n")) {
+        const t = line.trim();
+        if (!t.startsWith("data:")) continue;
+        const payload = t.slice(5).trim();
+        if (!payload) continue;
+        if (payload === "[DONE]") return;
+
+        const parsed = safeJsonParse(payload);
+        if (parsed.ok) onData(parsed.value);
       }
     }
   }
-  throw new Error("JSON appears truncated or unbalanced.");
 }
 
-async function httpFetch(url, method, body, { timeoutMs = 120000, headers = {}, expect = "json" } = {}) {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, {
-      method,
-      headers: {
-        ...(body ? { "Content-Type": "application/json" } : {}),
-        ...headers
+async function lmChat({ baseUrl, apiKey, body, onDelta, signal }) {
+  const url = `${stripTrailingSlashes(baseUrl)}/chat/completions`;
+  const wantsStream = body.stream !== false;
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: lmHeaders(apiKey),
+    body: JSON.stringify(body),
+    signal
+  });
+
+  if (!resp.ok) {
+    const t = await resp.text().catch(() => "");
+    const err = new Error(`LM chat failed: ${resp.status} ${resp.statusText} ${t}`.trim());
+    err.http_status = resp.status;
+    throw err;
+  }
+
+  const contentType = resp.headers.get("content-type") || "";
+
+  if (wantsStream && contentType.includes("text/event-stream")) {
+    let assembled = "";
+
+    await streamSse(
+      resp,
+      (chunk) => {
+        const deltaText = chunk?.choices?.[0]?.delta?.content;
+        if (typeof deltaText === "string" && deltaText.length) {
+          assembled += deltaText;
+          if (onDelta) onDelta(deltaText);
+        }
       },
-      body: body ? JSON.stringify(body) : undefined,
-      signal: ctrl.signal
-    });
+      signal
+    );
 
-    const contentType = res.headers.get("content-type") || "";
-    if (!res.ok) {
-      const errText = await res.text().catch(() => "");
-      throw new Error(`HTTP ${res.status} ${res.statusText}: ${errText.slice(0, 1200)}`);
+    return assembled;
+  }
+
+  const data = await resp.json();
+  return (
+    data?.choices?.[0]?.message?.content ??
+    data?.choices?.[0]?.text ??
+    ""
+  );
+}
+
+async function lmListModels({ baseUrl, apiKey }) {
+  const url = `${stripTrailingSlashes(baseUrl)}/models`;
+  const resp = await fetch(url, { headers: lmHeaders(apiKey) });
+  if (!resp.ok) {
+    const t = await resp.text().catch(() => "");
+    throw new Error(`LM /models failed: ${resp.status} ${resp.statusText} ${t}`.trim());
+  }
+  return await resp.json();
+}
+
+/* =========================
+   Emitters (CLI + WS)
+   ========================= */
+
+function createCliEmitter() {
+  return {
+    started: (id) => {
+      if (id) process.stdout.write(`[started] ${id}\n`);
+    },
+    delta: (s) => {
+      if (!s) return;
+      process.stdout.write(String(s));
+    },
+    done: (id, message) => {
+      if (id) process.stdout.write(`\n[done] ${id}\n`);
+      process.stdout.write(String(message || "").trimEnd() + "\n");
+    },
+    error: (id, err) => {
+      if (id) process.stdout.write(`\n[error] ${id}\n`);
+      process.stdout.write(String(err?.message || err || "error") + "\n");
+    }
+  };
+}
+
+function createWsEmitter(ws, id) {
+  const wsSend = (obj) => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify(obj));
+  };
+
+  return {
+    started: () => wsSend({ type: "started", id }),
+    delta: (s) => {
+      if (!s) return;
+      wsSend({ type: "delta", id, delta: String(s) });
+    },
+    done: (message) => wsSend({ type: "done", id, message: String(message || "") }),
+    error: (err) =>
+      wsSend({
+        type: "error",
+        id,
+        error: { message: String(err?.message || err || "error"), http_status: err?.http_status }
+      })
+  };
+}
+
+/* =========================
+   Tool implementations
+   ========================= */
+
+async function apiHttp({ apiBaseUrl, httpTimeoutMs, allowWrite }, action) {
+  const method = String(action?.method || "GET").toUpperCase();
+  const path = normalizePath(action?.path || "/health");
+
+  if (isWriteMethod(method) && !allowWrite) {
+    const e = new Error(`Write method ${method} blocked (enable --allow-write).`);
+    e.http_status = 403;
+    throw e;
+  }
+
+  const u = new URL(joinUrl(apiBaseUrl, path));
+  const query = action?.query && typeof action.query === "object" ? action.query : null;
+  if (query) {
+    for (const [k, v] of Object.entries(query)) {
+      if (v === undefined || v === null) continue;
+      u.searchParams.set(k, String(v));
+    }
+  }
+
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), httpTimeoutMs);
+
+  try {
+    const headers = { "content-type": "application/json" };
+    const body = action?.body !== undefined ? JSON.stringify(action.body) : undefined;
+
+    const resp = await fetch(u.toString(), { method, headers, body, signal: controller.signal });
+    const ct = resp.headers.get("content-type") || "";
+    const text = await resp.text().catch(() => "");
+
+    let data = null;
+    if (ct.includes("application/json") && text) {
+      const parsed = safeJsonParse(text);
+      data = parsed.ok ? parsed.value : { _raw: text };
+    } else {
+      data = text;
     }
 
-    if (expect === "bytes") {
-      const ab = await res.arrayBuffer();
-      return { ok: true, contentType, data: Buffer.from(ab) };
-    }
-    if (expect === "text") {
-      const txt = await res.text();
-      return { ok: true, contentType, data: txt };
-    }
-
-    // default json (but tolerate non-json if server returns bytes)
-    const txt = await res.text();
-    try {
-      return { ok: true, contentType, data: JSON.parse(txt) };
-    } catch {
-      return { ok: true, contentType, data: txt };
-    }
+    return {
+      ok: resp.ok,
+      status: resp.status,
+      statusText: resp.statusText,
+      url: u.toString(),
+      method,
+      data
+    };
   } finally {
     clearTimeout(t);
   }
 }
 
-async function chatCompletion({ baseUrl, model, temperature, messages }, state, { retries = 3 } = {}) {
-  if (state.exec.llmCalls >= state.config.maxLlmCalls) {
-    throw new Error(`LLM call budget exceeded (max-llm-calls=${state.config.maxLlmCalls}).`);
-  }
-  const url = `${baseUrl.replace(/\/$/, "")}/chat/completions`;
-  let lastErr;
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      const payload = { model, temperature, messages };
-      const out = await httpFetch(url, "POST", payload, { timeoutMs: 180000, expect: "json" });
-      const raw = out.data;
-      const choice = raw?.choices?.[0];
-      const content = choice?.message?.content ?? "";
-      state.exec.llmCalls++;
-      return { raw, content };
-    } catch (e) {
-      lastErr = e;
-      const backoff = 400 * Math.pow(2, attempt) + Math.random() * 150;
-      await sleep(backoff);
+async function crewPresence({ apiBaseUrl, crewPresenceWsPath, presenceToken, presenceTimeoutMs }, action) {
+  const wsUrl = buildWsUrlFromHttp(apiBaseUrl, crewPresenceWsPath, presenceToken ? { token: presenceToken } : null);
+
+  return await new Promise((resolve, reject) => {
+    let done = false;
+    let timer = null;
+
+    const ws = new WebSocket(wsUrl);
+
+    function finish(ok, payload) {
+      if (done) return;
+      done = true;
+      if (timer) clearTimeout(timer);
+      try { ws.close(); } catch {}
+      ok ? resolve(payload) : reject(payload);
     }
-  }
-  throw lastErr;
+
+    timer = setTimeout(() => {
+      finish(true, { ok: true, online: [], note: "timeout_no_update" });
+    }, presenceTimeoutMs);
+
+    ws.on("open", () => {
+      // optional identify (your browser sends this)
+      const crewMemberId = action?.crewMemberId ?? null;
+      ws.send(JSON.stringify({ type: "crew-presence-identify", crewMemberId }));
+    });
+
+    ws.on("message", (data) => {
+      const text = Buffer.isBuffer(data) ? data.toString("utf8") : String(data);
+      const parsed = safeJsonParse(text);
+      if (!parsed.ok) return;
+
+      const msg = parsed.value;
+      if (msg?.type === "crew-presence-welcome" || msg?.type === "crew-presence-update") {
+        const online = Array.isArray(msg.online) ? msg.online : [];
+        finish(true, { ok: true, online });
+      }
+    });
+
+    ws.on("error", (err) => finish(true, { ok: false, online: [], error: err?.message || String(err) }));
+    ws.on("close", () => {
+      if (!done) finish(true, { ok: true, online: [], note: "closed_no_update" });
+    });
+  });
 }
 
-// -----------------------------
-// SURVEY-CAD API action execution
-// -----------------------------
-function normalizePath(p) {
-  if (!p) return "/";
-  const s = String(p).trim();
-  if (!s.startsWith("/")) return "/" + s;
-  return s;
-}
-function isWriteMethod(m) {
-  const mm = String(m || "GET").toUpperCase();
-  return mm !== "GET" && mm !== "HEAD";
-}
+/* =========================
+   LLM-driven router + tool planner
+   ========================= */
 
-async function runApiAction(state, action) {
-  if (state.exec.actionsTaken >= state.config.maxActions) {
-    throw new Error(`API action budget exceeded (max-actions=${state.config.maxActions}).`);
-  }
+async function routeDecision({ prompt, args, emit, signal }) {
+  // LLM-first router (no “question-specific hacks”)
+  const sys = `You are a router for an agent with three modes:
+- chat: normal conversational answer, no external calls needed.
+- tool: use tools (HTTP/WebSocket) to fetch/act in SURVEY-CAD API.
+- solver: for complex multi-step problems needing decomposition, retries, and adaptation.
 
-  const method = String(action.method || "GET").toUpperCase();
-  const p = normalizePath(action.path || action.endpoint || "/health");
-  const query = (action.query && typeof action.query === "object") ? action.query : {};
-  const body = (action.body && typeof action.body === "object") ? action.body : null;
-
-  if (isWriteMethod(method)) {
-    if (!state.config.allowWrite && !state.config.allowWriteAny) {
-      throw new Error(`Write method ${method} blocked. Run with --allow-write (allowlist) or --allow-write-any (dangerous).`);
-    }
-    if (!state.config.allowWriteAny && !WRITE_ALLOWLIST.has(p)) {
-      throw new Error(`Write to ${p} blocked by allowlist. Use --allow-write-any to override.`);
-    }
-  }
-
-  // Build URL
-  const base = state.config.apiBaseUrl.replace(/\/$/, "");
-  const url = new URL(base + p);
-  for (const [k, v] of Object.entries(query)) {
-    if (v === undefined || v === null) continue;
-    url.searchParams.set(k, String(v));
-  }
-
-  // Decide expected response type
-  // - bytes for pdf/images
-  // - json by default
-  const expect = String(action.expect || "").toLowerCase() || (
-    p.includes("ros-pdf") || p.includes("static-map") ? "bytes" : "json"
-  );
-
-  const timeoutMs = action.timeoutMs != null ? Number(action.timeoutMs) : state.config.apiTimeoutMs;
-
-  const headers = (action.headers && typeof action.headers === "object") ? action.headers : {};
-
-  const startedAt = new Date().toISOString();
-  const resp = await httpFetch(url.toString(), method, body, { timeoutMs, headers, expect });
-
-  state.exec.actionsTaken++;
-
-  // Save artifacts
-  const apiDir = path.join(state.outDir, "api");
-  ensureDirSync(apiDir);
-
-  const safeNameBase = String(action.saveAs || action.name || `${method}_${p.replace(/[\/\?\&\=]+/g, "_")}`)
-    .slice(0, 120)
-    .replace(/[^a-zA-Z0-9_\-.]/g, "_");
-
-  let savedFile = null;
-  let summary;
-
-  if (expect === "bytes") {
-    const ext = resp.contentType.includes("pdf") ? ".pdf"
-      : (resp.contentType.includes("png") ? ".png"
-      : (resp.contentType.includes("jpeg") || resp.contentType.includes("jpg") ? ".jpg" : ".bin"));
-    savedFile = path.join(apiDir, `${safeNameBase}${ext}`);
-    await fsp.writeFile(savedFile, resp.data);
-    summary = { savedFile, contentType: resp.contentType, bytes: resp.data.length };
-  } else {
-    savedFile = path.join(apiDir, `${safeNameBase}.json`);
-    const jsonOut = {
-      url: url.toString(),
-      method,
-      path: p,
-      query,
-      requestBody: body,
-      contentType: resp.contentType,
-      response: resp.data
-    };
-    await fsp.writeFile(savedFile, JSON.stringify(jsonOut, null, 2), "utf8");
-    summary = { savedFile, contentType: resp.contentType, responsePreview: truncateForModel(resp.data, 2500) };
-  }
-
-  const finishedAt = new Date().toISOString();
-  return {
-    ok: true,
-    startedAt,
-    finishedAt,
-    request: { method, url: url.toString(), path: p, query, body },
-    response: {
-      contentType: resp.contentType,
-      expect,
-      data: (expect === "bytes") ? { savedFile, bytes: resp.data.length } : resp.data
-    },
-    artifact: summary
-  };
-}
-
-// -----------------------------
-// Prompts
-// -----------------------------
-function apiQuickRef(apiBaseUrl) {
-  // Keep this compact but sufficient for the model to choose endpoints.
-  return `
-SURVEY-CAD API QUICK REF (base: ${apiBaseUrl})
-
-Health / apps:
-- GET /health -> {ok:true}
-- GET /api/apps -> {apps:[{id,title,path}]}
-
-Survey/Geo:
-- GET /api/geocode?address=...
-- GET /api/lookup?address=...
-- GET /api/parcel?lon=...&lat=...&outSR=4326&searchMeters=40
-- GET /api/section?lon=...&lat=...
-- GET /api/aliquots?lon=...&lat=...&outSR=4326
-- GET /api/subdivision?lon=...&lat=...&outSR=4326
-- GET /api/static-map?lon=...&lat=...&address=...  (may return image bytes)
-
-Utilities:
-- GET /api/utilities?address=...&outSR=2243&sources=power,water
-
-Project file:
-- GET /api/project-file/template?projectName=...&client=...&address=...&resources=<json-encoded-array>
-- POST /api/project-file/compile  body: {"projectFile":{...}} OR {"project":{...}}
-
-FLD:
-- GET /api/fld-config?file=config/MLS.fld
-
-LocalStorage Sync:
-- GET /api/localstorage-sync
-- POST /api/localstorage-sync body: {"version":<ms>,"snapshot":{...}}
-
-ROS/OCR:
-- POST /extract (schema depends on server)
-- GET /api/ros-pdf?url=https://...  (returns PDF bytes)
-`.trim();
-}
-
-function planPrompt(problem, maxTasks = 8, apiBaseUrl) {
-  return [
-    {
-      role: "system",
-      content:
-`You are a rigorous problem decomposition engine.
-Return ONLY valid JSON. No markdown, no commentary.
-Your job: turn the user's problem into an actionable task list with clear success criteria.
-
-You MAY incorporate real-world verification steps by calling the SURVEY-CAD API via the runner later. Keep plan tasks concrete.
-
-${apiQuickRef(apiBaseUrl)}
-
-JSON schema:
-{
-  "goal": "string",
-  "assumptions": ["string", ...],
-  "constraints": ["string", ...],
-  "tasks": [
-    {
-      "title": "string",
-      "description": "string",
-      "success_criteria": ["string", ...],
-      "can_decompose": true|false,
-      "priority": 1..5
-    }
-  ],
-  "stop_condition": "string"
-}
+Return ONLY JSON:
+{"route":"chat"|"tool"|"solver","reason":"...","confidence":0..1}
 
 Rules:
-- tasks length <= ${maxTasks}
-- Tasks ordered by dependency (earlier enables later).
-- Prefer concrete outputs (draft, algorithm, checklist, proof sketch, code, test plan).`
+- If the user asks about live system state (who is online, add crew member, fetch records), choose tool.
+- If the user asks for a complex multi-layer plan / recursive solving, choose solver.
+- Otherwise choose chat.`;
+
+  const text = await lmChat({
+    baseUrl: args.baseUrl,
+    apiKey: args.lmApiKey,
+    body: {
+      model: args.model,
+      temperature: 0.0,
+      max_tokens: 220,
+      stream: false,
+      messages: [
+        { role: "system", content: sys },
+        { role: "user", content: `User prompt:\n${prompt}` }
+      ]
     },
-    { role: "user", content: `Problem:\n${problem}` }
-  ];
+    signal
+  });
+
+  const j = extractLikelyJson(text);
+  if (j && (j.route === "chat" || j.route === "tool" || j.route === "solver")) return j;
+
+  // minimal fallback if model returns junk
+  return { route: "chat", reason: "router_parse_failed", confidence: 0.2 };
 }
 
-function solveTaskPrompt({ problem, plan, task, contextSummary, depth, apiBaseUrl, allowWrite, toolResultsSummary }) {
-  const planBrief = {
-    goal: plan.goal,
-    constraints: plan.constraints?.slice?.(0, 8) ?? [],
-    stop_condition: plan.stop_condition
-  };
+async function proposeToolActions({ prompt, args, emit, toolResults, signal }) {
+  const sys = `You are a tool planner for SURVEY-CAD.
 
-  return [
-    {
-      role: "system",
-      content:
-`You are an expert solver inside a recursive planner/executor.
-
-CRITICAL: Return ONLY valid JSON. No markdown. No extra keys beyond schema.
-
-You have access to SURVEY-CAD API via the runner if you need real data.
-To request an API call, include an "actions" array with items shaped like:
-
+You can emit a JSON plan with actions. Return ONLY JSON:
 {
-  "type": "api_http",
-  "method": "GET" | "POST",
-  "path": "/api/lookup",
-  "query": { "address": "..." },
-  "body": { ... },              // only for POST
-  "expect": "json" | "text" | "bytes",
-  "saveAs": "optional_filename_base"
-}
-
-Runner policy:
-- GET is allowed by default.
-- Writes require allowWrite=true. Current allowWrite=${allowWrite}.
-- Even if allowWrite=true, writes are allowlisted unless allowWriteAny was enabled.
-
-${apiQuickRef(apiBaseUrl)}
-
-JSON schema:
-{
-  "status": "done" | "needs_breakdown" | "blocked" | "revise_plan",
-  "result": "string",
-  "confidence": 0.0-1.0,
-  "notes": ["string", ...],
-  "blockers": ["string", ...],
-  "sub_tasks": [
-    { "title":"string","description":"string","success_criteria":["string",...],"can_decompose":true|false,"priority":1..5 }
+  "actions":[
+    {"type":"crew_presence","crewMemberId":null},
+    {"type":"api_http","method":"GET","path":"/api/crew","query":{}},
+    {"type":"api_http","method":"POST","path":"/api/crew","body":{...}}
   ],
-  "plan_feedback": {
-    "is_plan_working": true|false,
-    "suggested_changes": ["string", ...]
-  },
-  "actions": [
-    { "type":"api_http","method":"GET","path":"/health","query":{} }
+  "note":"short optional"
+}
+
+Allowed actions:
+- crew_presence: connect to /ws/crew-presence, read online IDs.
+- api_http: call documented HTTP endpoints.
+
+Hard requirements:
+- Prefer HUMAN-READABLE outputs. If you obtain opaque IDs (UUIDs), plan follow-up API calls to fetch names (e.g., GET /api/crew) and map IDs to names before answering.
+- If user asks to create/update data, use POST/PUT only if allowed; otherwise propose a read-only alternative or ask for --allow-write.
+- If a previous attempt failed, use the error text to fix the payload and RETRY.
+
+API reference:
+${API_REFERENCE}
+
+If the user's task is answerable without tools, return {"actions":[], "note":"no_tools_needed"}.
+
+If tools ARE needed, return 1–4 actions maximum.`;
+
+  const user = toolResults
+    ? `User prompt:\n${prompt}\n\nPrevious tool results/errors:\n${truncate(toolResults, 7000)}`
+    : `User prompt:\n${prompt}`;
+
+  const text = await lmChat({
+    baseUrl: args.baseUrl,
+    apiKey: args.lmApiKey,
+    body: {
+      model: args.model,
+      temperature: 0.1,
+      max_tokens: 600,
+      stream: false,
+      messages: [
+        { role: "system", content: sys },
+        { role: "user", content: user }
+      ]
+    },
+    signal
+  });
+
+  const j = extractLikelyJson(text);
+  if (j && Array.isArray(j.actions)) return j;
+
+  return { actions: [], note: "planner_parse_failed" };
+}
+
+function hasFailures(toolResults) {
+  return toolResults.some((r) => r && r.ok === false);
+}
+
+async function synthesizeAnswer({ prompt, args, toolResults, emit, signal }) {
+  const sys = `You are the final answer writer.
+
+Use ONLY the tool results. Do not invent endpoints or data.
+Make the answer HUMAN-READABLE; prefer names over IDs.
+If IDs appear and no names were fetched, say that and recommend the next tool call (e.g. GET /api/crew) that would resolve them.
+
+Keep it concise.`;
+
+  const text = await lmChat({
+    baseUrl: args.baseUrl,
+    apiKey: args.lmApiKey,
+    body: {
+      model: args.model,
+      temperature: 0.2,
+      max_tokens: args.maxTokens,
+      stream: args.stream,
+      messages: [
+        { role: "system", content: sys },
+        { role: "user", content: `Prompt:\n${prompt}\n\nTool results:\n${truncate(toolResults, 9000)}` }
+      ]
+    },
+    onDelta: args.stream ? (d) => emit.delta(d) : null,
+    signal
+  });
+
+  if (!args.stream) emit.delta(text);
+  return text;
+}
+
+/* =========================
+   Tool route runner (with repair)
+   ========================= */
+
+async function runToolRoute({ prompt, args, emit, signal }) {
+  const toolResults = [];
+  let plan = await proposeToolActions({ prompt, args, emit, toolResults: null, signal });
+
+  for (let round = 0; round <= args.toolRepairRounds; round++) {
+    const actions = Array.isArray(plan?.actions) ? plan.actions : [];
+
+    if (!actions.length) {
+      // No actions proposed; still produce a response (chat-style) without “giving up”
+      emit.delta(`[augment] no_actions -> synthesize\n`);
+      const final = await lmChat({
+        baseUrl: args.baseUrl,
+        apiKey: args.lmApiKey,
+        body: {
+          model: args.model,
+          temperature: 0.2,
+          max_tokens: args.maxTokens,
+          stream: args.stream,
+          messages: [
+            {
+              role: "system",
+              content:
+`Answer the user directly if possible.
+If the task needs tools but none were used, explain what tool info is missing and what you would call next.`
+            },
+            { role: "user", content: prompt }
+          ]
+        },
+        onDelta: args.stream ? (d) => emit.delta(d) : null,
+        signal
+      });
+
+      if (!args.stream) emit.delta(final);
+      return final;
+    }
+
+    // Execute actions
+    toolResults.length = 0;
+
+    for (const a of actions.slice(0, 4)) {
+      const type = String(a?.type || "");
+      try {
+        if (type === "crew_presence") {
+          emit.delta(`[ws] crew-presence\n`);
+          const res = await crewPresence(
+            {
+              apiBaseUrl: args.apiBaseUrl,
+              crewPresenceWsPath: args.crewPresenceWsPath,
+              presenceToken: args.presenceToken,
+              presenceTimeoutMs: args.presenceTimeoutMs
+            },
+            a
+          );
+          toolResults.push({ type, ok: true, result: res });
+          emit.delta(`[ws:ok] online=${Array.isArray(res.online) ? res.online.length : 0}\n`);
+        } else if (type === "api_http") {
+          const method = String(a?.method || "GET").toUpperCase();
+          const path = normalizePath(a?.path || "/health");
+          emit.delta(`[http] ${method} ${path}\n`);
+          const res = await apiHttp(
+            { apiBaseUrl: args.apiBaseUrl, httpTimeoutMs: args.httpTimeoutMs, allowWrite: args.allowWrite },
+            a
+          );
+          toolResults.push({ type, ok: res.ok, result: res });
+          if (!res.ok) {
+            emit.delta(`[tool:error] HTTP ${res.status} ${res.statusText}: ${truncate(res.data, 1200)}\n`);
+          } else {
+            emit.delta(`[http:ok]\n`);
+          }
+        } else {
+          toolResults.push({ type, ok: false, error: "unknown_action_type", action: a });
+          emit.delta(`[tool:error] unknown action type: ${type}\n`);
+        }
+      } catch (e) {
+        toolResults.push({ type, ok: false, error: e?.message || String(e), action: a, http_status: e?.http_status });
+        emit.delta(`[tool:error] ${e?.message || String(e)}\n`);
+      }
+    }
+
+    emit.delta("\n");
+
+    // If everything ok, synthesize and return
+    if (!hasFailures(toolResults)) {
+      const final = await synthesizeAnswer({ prompt, args, toolResults, emit, signal });
+      if (!args.stream) emit.delta("\n");
+      return final;
+    }
+
+    // Repair: feed tool results/errors back into planner
+    if (round === args.toolRepairRounds) break;
+
+    emit.delta(`[repair] round=${round + 1}/${args.toolRepairRounds}\n`);
+    plan = await proposeToolActions({ prompt, args, emit, toolResults, signal });
+    emit.delta("\n");
+  }
+
+  // Final attempt: synthesize even with failures (don’t give up)
+  const final = await synthesizeAnswer({ prompt, args, toolResults, emit, signal });
+  if (!args.stream) emit.delta("\n");
+  return final;
+}
+
+/* =========================
+   Solver route runner (decompose + adapt)
+   ========================= */
+
+async function makeSolverPlan({ prompt, args, emit, signal }) {
+  const sys = `You are a recursive problem solver.
+
+Return ONLY JSON:
+{
+  "goal":"...",
+  "steps":[
+    {"id":"S1","kind":"tool"|"chat","title":"...","details":"..."},
+    ...
   ]
 }
 
 Rules:
-- If task is too large/ambiguous, use status="needs_breakdown" and propose sub_tasks.
-- If you discover the plan path is wrong, use status="revise_plan".
-- If you need API data, request 1-4 actions max, then wait for results.
-- Depth=${depth}. Keep breakdown limited.`
+- Use 3–${args.solverMaxSteps} steps.
+- Use kind="tool" if you need API/WebSocket info or actions.
+- Use kind="chat" for reasoning/synthesis without external calls.
+- Prefer human-readable outcomes; if IDs appear in tool steps, include a follow-up tool step to resolve names.`;
+
+  const text = await lmChat({
+    baseUrl: args.baseUrl,
+    apiKey: args.lmApiKey,
+    body: {
+      model: args.model,
+      temperature: 0.1,
+      max_tokens: 900,
+      stream: false,
+      messages: [
+        { role: "system", content: sys },
+        { role: "user", content: `Prompt:\n${prompt}\n\nAPI reference:\n${API_REFERENCE}` }
+      ]
     },
-    {
-      role: "user",
-      content:
-`Overall problem:
-${problem}
-
-Current plan summary:
-${JSON.stringify(planBrief, null, 2)}
-
-Task to solve (depth ${depth}):
-${JSON.stringify({
-  title: task.title,
-  description: task.description,
-  success_criteria: task.success_criteria,
-}, null, 2)}
-
-Context so far (completed work summary):
-${contextSummary || "(none)"}
-
-Recent tool/API results (summary):
-${toolResultsSummary || "(none)"}`
-    }
-  ];
-}
-
-function reflectPrompt({ problem, plan, progressSnapshot }) {
-  return [
-    {
-      role: "system",
-      content:
-`You are a reflection engine for an iterative problem solver.
-Return ONLY JSON, no markdown.
-
-Schema:
-{
-  "progress_summary": "string",
-  "risks": ["string", ...],
-  "next_focus": "string",
-  "plan_health": "green" | "yellow" | "red"
-}`
-    },
-    {
-      role: "user",
-      content:
-`Problem:
-${problem}
-
-Plan:
-${JSON.stringify({ goal: plan.goal, stop_condition: plan.stop_condition }, null, 2)}
-
-Progress snapshot:
-${JSON.stringify(progressSnapshot, null, 2)}`
-    }
-  ];
-}
-
-function revisePlanPrompt({ problem, currentPlan, completedSummaries, issues, apiBaseUrl }) {
-  return [
-    {
-      role: "system",
-      content:
-`You are a replanner. Return ONLY valid JSON.
-
-${apiQuickRef(apiBaseUrl)}
-
-Schema:
-{
-  "goal": "string",
-  "assumptions": ["string", ...],
-  "constraints": ["string", ...],
-  "tasks": [
-    { "title":"string","description":"string","success_criteria":["string",...],"can_decompose":true|false,"priority":1..5 }
-  ],
-  "stop_condition": "string",
-  "rationale": "string"
-}
-
-Rules:
-- Keep tasks <= 10.
-- Preserve what is already completed by not re-adding identical tasks.
-- Adjust ordering and scope to fix the failure mode.`
-    },
-    {
-      role: "user",
-      content:
-`Problem:
-${problem}
-
-Current plan:
-${JSON.stringify(currentPlan, null, 2)}
-
-Completed work summaries:
-${completedSummaries}
-
-Issues / failure mode:
-${issues}`
-    }
-  ];
-}
-
-// -----------------------------
-// State model
-// -----------------------------
-function newState({ problem, config, outDir, stateFile }) {
-  return {
-    version: 2,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    problem,
-    config,
-    outDir,
-    stateFile,
-    plan: null,
-    tasks: {},         // id -> task node
-    rootTaskIds: [],
-    exec: {
-      stepsTaken: 0,
-      lastTaskId: null,
-      reflection: null,
-      llmCalls: 0,
-      actionsTaken: 0,
-    },
-    history: [],       // events
-    final: null,
-  };
-}
-
-function taskNodeFromModelTask(modelTask, { parentId = null, depth = 0 }) {
-  return {
-    id: uid("T"),
-    parentId,
-    depth,
-    title: String(modelTask.title || "Untitled task").slice(0, 180),
-    description: String(modelTask.description || ""),
-    success_criteria: Array.isArray(modelTask.success_criteria) ? modelTask.success_criteria.map(String) : [],
-    can_decompose: !!modelTask.can_decompose,
-    priority: clamp(Number(modelTask.priority ?? 3), 1, 5),
-    status: "pending",         // pending|expanded|done|blocked
-    attempts: 0,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    children: [],
-    outputs: [],               // {ts, kind, content, meta}
-    blockers: [],
-    toolResults: [],           // per-task tool/API results
-  };
-}
-
-function summarizeCompleted(state, maxChars = 4000) {
-  const done = Object.values(state.tasks).filter(t => t.status === "done");
-  done.sort((a, b) => (b.updatedAt || "").localeCompare(a.updatedAt || ""));
-  let txt = "";
-  for (const t of done) {
-    const last = t.outputs?.slice?.(-1)?.[0];
-    const snippet = (last?.content || "").slice(0, 900);
-    txt += `\n- ${t.title}\n  ${snippet}\n`;
-    if (txt.length > maxChars) break;
-  }
-  return txt.trim() || "(none)";
-}
-
-function summarizeRecentToolResults(task, maxChars = 3500) {
-  const rows = (task.toolResults || []).slice(-6);
-  let s = "";
-  for (const r of rows) {
-    s += `\n- ${r.request?.method} ${r.request?.path}  (${r.response?.contentType || "?"})`;
-    if (r.artifact?.savedFile) s += `\n  saved: ${r.artifact.savedFile}`;
-    if (r.response?.expect !== "bytes") {
-      s += `\n  response: ${truncateForModel(r.response?.data, 900)}`;
-    } else {
-      s += `\n  response: <bytes saved>`;
-    }
-    s += "\n";
-    if (s.length > maxChars) break;
-  }
-  return s.trim() || "(none)";
-}
-
-function pickNextTaskId(state) {
-  const byDepth = Object.values(state.tasks)
-    .filter(t => t.status === "pending")
-    .sort((a, b) => a.depth - b.depth || a.priority - b.priority || a.createdAt.localeCompare(b.createdAt));
-  return byDepth.length ? byDepth[0].id : null;
-}
-
-async function saveState(state) {
-  state.updatedAt = new Date().toISOString();
-  await fsp.writeFile(state.stateFile, JSON.stringify(state, null, 2), "utf8");
-}
-
-async function writeArtifact(state, name, content) {
-  const file = path.join(state.outDir, name);
-  await fsp.writeFile(file, content, "utf8");
-  return file;
-}
-
-// -----------------------------
-// Main flow
-// -----------------------------
-async function listModels(baseUrl) {
-  const url = `${baseUrl.replace(/\/$/, "")}/models`;
-  const out = await httpFetch(url, "GET", null, { timeoutMs: 30000, expect: "json" });
-  const data = out?.data?.data ?? out?.data ?? [];
-  for (const m of data) console.log(m?.id ?? JSON.stringify(m));
-}
-
-async function generatePlan(state) {
-  logInfo("Generating initial plan (task list)...");
-  const messages = planPrompt(state.problem, 8, state.config.apiBaseUrl);
-  const { content } = await chatCompletion({
-    baseUrl: state.config.baseUrl,
-    model: state.config.model,
-    temperature: state.config.temperature,
-    messages
-  }, state);
-
-  const plan = tryExtractJson(content);
-  if (!plan || !Array.isArray(plan.tasks)) throw new Error("Plan JSON missing 'tasks' array.");
-
-  state.plan = {
-    goal: String(plan.goal || "Solve the problem"),
-    assumptions: Array.isArray(plan.assumptions) ? plan.assumptions.map(String) : [],
-    constraints: Array.isArray(plan.constraints) ? plan.constraints.map(String) : [],
-    stop_condition: String(plan.stop_condition || "All tasks completed with success criteria met."),
-  };
-
-  state.rootTaskIds = [];
-  for (const mt of plan.tasks.slice(0, 10)) {
-    const node = taskNodeFromModelTask(mt, { parentId: null, depth: 0 });
-    state.tasks[node.id] = node;
-    state.rootTaskIds.push(node.id);
-  }
-
-  state.history.push({ ts: new Date().toISOString(), type: "plan_generated", plan: state.plan, roots: state.rootTaskIds });
-  await saveState(state);
-
-  logOk(`Plan created with ${state.rootTaskIds.length} root tasks.`);
-}
-
-async function maybeRevisePlan(state, issues) {
-  if (!state.config.allowRevise) return false;
-
-  logWarn("Revising plan (LLM says the current path is wrong)...");
-  const completedSummaries = summarizeCompleted(state, 6000);
-
-  const messages = revisePlanPrompt({
-    problem: state.problem,
-    currentPlan: state.plan,
-    completedSummaries,
-    issues,
-    apiBaseUrl: state.config.apiBaseUrl
+    signal
   });
 
-  const { content } = await chatCompletion({
-    baseUrl: state.config.baseUrl,
-    model: state.config.model,
-    temperature: Math.max(0.1, state.config.temperature),
-    messages
-  }, state);
+  const j = extractLikelyJson(text);
+  if (j && Array.isArray(j.steps) && j.steps.length) return j;
 
-  const newPlan = tryExtractJson(content);
-  if (!newPlan || !Array.isArray(newPlan.tasks)) {
-    logWarn("Plan revision returned invalid JSON; continuing with current plan.");
-    return false;
-  }
-
-  const existingTitles = new Set(Object.values(state.tasks).map(t => t.title.trim().toLowerCase()));
-  const added = [];
-
-  for (const mt of newPlan.tasks.slice(0, 10)) {
-    const title = String(mt.title || "").trim().toLowerCase();
-    if (!title || existingTitles.has(title)) continue;
-    const node = taskNodeFromModelTask(mt, { parentId: null, depth: 0 });
-    state.tasks[node.id] = node;
-    state.rootTaskIds.push(node.id);
-    added.push(node.id);
-    existingTitles.add(title);
-  }
-
-  state.plan.goal = String(newPlan.goal || state.plan.goal);
-  state.plan.assumptions = Array.isArray(newPlan.assumptions) ? newPlan.assumptions.map(String) : state.plan.assumptions;
-  state.plan.constraints = Array.isArray(newPlan.constraints) ? newPlan.constraints.map(String) : state.plan.constraints;
-  state.plan.stop_condition = String(newPlan.stop_condition || state.plan.stop_condition);
-
-  state.history.push({
-    ts: new Date().toISOString(),
-    type: "plan_revised",
-    rationale: String(newPlan.rationale || ""),
-    addedRootTaskIds: added
-  });
-  await saveState(state);
-
-  logOk(`Plan revised. Added ${added.length} new root task(s).`);
-  return true;
+  return {
+    goal: prompt,
+    steps: [{ id: "S1", kind: "chat", title: "Answer", details: "Answer directly." }]
+  };
 }
 
-async function reflect(state) {
-  const progressSnapshot = {
-    stepsTaken: state.exec.stepsTaken,
-    llmCalls: state.exec.llmCalls,
-    actionsTaken: state.exec.actionsTaken,
-    counts: {
-      pending: Object.values(state.tasks).filter(t => t.status === "pending").length,
-      expanded: Object.values(state.tasks).filter(t => t.status === "expanded").length,
-      done: Object.values(state.tasks).filter(t => t.status === "done").length,
-      blocked: Object.values(state.tasks).filter(t => t.status === "blocked").length,
+async function assessGoal({ prompt, args, emit, state, signal }) {
+  const sys = `You are a completion checker.
+
+Return ONLY JSON: {"done":true|false,"reason":"..."}
+
+Decide if the user's request is fully satisfied based on the current state.`;
+  const text = await lmChat({
+    baseUrl: args.baseUrl,
+    apiKey: args.lmApiKey,
+    body: {
+      model: args.model,
+      temperature: 0.0,
+      max_tokens: 180,
+      stream: false,
+      messages: [
+        { role: "system", content: sys },
+        { role: "user", content: `Prompt:\n${prompt}\n\nState:\n${truncate(state, 8000)}` }
+      ]
     },
-    lastTask: state.exec.lastTaskId ? {
-      id: state.exec.lastTaskId,
-      title: state.tasks[state.exec.lastTaskId]?.title,
-      status: state.tasks[state.exec.lastTaskId]?.status,
-    } : null
+    signal
+  });
+
+  const j = extractLikelyJson(text);
+  if (j && typeof j.done === "boolean") return j;
+  return { done: true, reason: "assess_parse_failed_default_done" };
+}
+
+async function runSolverRoute({ prompt, args, emit, signal }) {
+  let plan = await makeSolverPlan({ prompt, args, emit, signal });
+  let state = {
+    goal: plan.goal || prompt,
+    steps: [],
+    toolRuns: [],
+    notes: []
   };
 
-  const { content } = await chatCompletion({
-    baseUrl: state.config.baseUrl,
-    model: state.config.model,
-    temperature: 0.2,
-    messages: reflectPrompt({ problem: state.problem, plan: state.plan, progressSnapshot })
-  }, state);
+  for (let replan = 0; replan <= args.solverMaxReplans; replan++) {
+    emit.delta(`[plan] goal: ${state.goal}\n`);
+    emit.delta(`[plan] steps: ${plan.steps.length}\n\n`);
 
-  try {
-    const refl = tryExtractJson(content);
-    state.exec.reflection = refl;
-    state.history.push({ ts: new Date().toISOString(), type: "reflection", ...refl });
-    await saveState(state);
-    logInfo(`Reflection: ${refl.plan_health?.toUpperCase?.() || "?"} — ${refl.next_focus || ""}`);
-  } catch {
-    // optional
-  }
-}
+    for (const step of plan.steps.slice(0, args.solverMaxSteps)) {
+      emit.delta(`[step] ${step.id || ""} ${step.kind || ""} — ${step.title || ""}\n`);
+      if (step.details) emit.delta(`[step] ${step.details}\n\n`);
 
-function validateActionsShape(actions) {
-  if (!Array.isArray(actions)) return [];
-  const out = [];
-  for (const a of actions) {
-    if (!a || typeof a !== "object") continue;
-    if (String(a.type || "api_http") !== "api_http") continue;
-    if (!a.path && !a.endpoint) continue;
-    out.push(a);
-  }
-  return out;
-}
+      if (step.kind === "tool") {
+        // Run tool route on the step.details (or whole prompt if missing)
+        const stepPrompt = step.details ? `${prompt}\n\n(Working on step: ${step.title})\n${step.details}` : prompt;
+        const before = Date.now();
+        const answer = await runToolRoute({ prompt: stepPrompt, args, emit, signal });
+        const after = Date.now();
+        state.toolRuns.push({ step: step.id, ms: after - before, output: answer });
+        state.steps.push({ id: step.id, kind: "tool", title: step.title, ok: true });
+        emit.delta("\n");
+      } else {
+        // chat reasoning step
+        const sys = `You are solving one step of a multi-step task. Be direct.`;
+        const stepText = await lmChat({
+          baseUrl: args.baseUrl,
+          apiKey: args.lmApiKey,
+          body: {
+            model: args.model,
+            temperature: args.temperature,
+            max_tokens: args.maxTokens,
+            stream: args.stream,
+            messages: [
+              { role: "system", content: sys },
+              { role: "user", content: `Main prompt:\n${prompt}\n\nStep:\n${step.title}\n${step.details || ""}\n\nCurrent state:\n${truncate(state, 8000)}` }
+            ]
+          },
+          onDelta: args.stream ? (d) => emit.delta(d) : null,
+          signal
+        });
 
-async function solveOneTask(state, taskId) {
-  const task = state.tasks[taskId];
-  if (!task) throw new Error(`Unknown taskId: ${taskId}`);
-
-  task.attempts++;
-  task.updatedAt = new Date().toISOString();
-  state.exec.lastTaskId = taskId;
-
-  logInfo(`Solving (depth ${task.depth}) — ${task.title}`);
-
-  // Inner loop: allow solver -> actions -> solver -> ...
-  let lastIssues = null;
-
-  for (let turn = 0; turn < state.config.maxTurnsPerTask; turn++) {
-    const contextSummary = summarizeCompleted(state, 5000);
-    const toolResultsSummary = summarizeRecentToolResults(task, 3200);
-
-    const messages = solveTaskPrompt({
-      problem: state.problem,
-      plan: state.plan,
-      task,
-      contextSummary,
-      depth: task.depth,
-      apiBaseUrl: state.config.apiBaseUrl,
-      allowWrite: state.config.allowWrite || state.config.allowWriteAny,
-      toolResultsSummary
-    });
-
-    const { content } = await chatCompletion({
-      baseUrl: state.config.baseUrl,
-      model: state.config.model,
-      temperature: state.config.temperature,
-      messages
-    }, state);
-
-    let out;
-    try {
-      out = tryExtractJson(content);
-    } catch (e) {
-      task.status = "blocked";
-      task.blockers = [`Model output was not valid JSON: ${e.message}`];
-      task.outputs.push({ ts: new Date().toISOString(), kind: "raw_model_output", content: String(content).slice(0, 8000) });
-      state.history.push({ ts: new Date().toISOString(), type: "task_blocked", taskId, reason: "invalid_json" });
-      await saveState(state);
-      return;
-    }
-
-    const status = out.status;
-    const result = String(out.result || "");
-    const confidence = Number(out.confidence ?? 0);
-    const notes = Array.isArray(out.notes) ? out.notes.map(String) : [];
-    const blockers = Array.isArray(out.blockers) ? out.blockers.map(String) : [];
-    const subTasks = Array.isArray(out.sub_tasks) ? out.sub_tasks : [];
-    const planFeedback = out.plan_feedback || {};
-    const actions = validateActionsShape(out.actions);
-
-    if (result) {
-      task.outputs.push({
-        ts: new Date().toISOString(),
-        kind: "result",
-        content: result,
-        meta: { confidence, notes, turn }
-      });
-    }
-
-    // If model requested actions, run them (bounded), then continue to next turn
-    if (actions.length) {
-      const toRun = actions.slice(0, state.config.maxActionsPerTurn);
-      logInfo(`Running ${toRun.length} API action(s)...`);
-
-      for (const action of toRun) {
-        try {
-          const apiResult = await runApiAction(state, action);
-          task.toolResults.push(apiResult);
-          task.outputs.push({
-            ts: new Date().toISOString(),
-            kind: "api_action",
-            content: truncateForModel(apiResult, 6000),
-            meta: { action }
-          });
-          state.history.push({ ts: new Date().toISOString(), type: "api_action", taskId, action: apiResult.request, artifact: apiResult.artifact });
-          await saveState(state);
-          logOk(`API OK: ${apiResult.request.method} ${apiResult.request.path}`);
-        } catch (e) {
-          const msg = String(e?.message || e);
-          task.toolResults.push({
-            ok: false,
-            error: msg,
-            request: action
-          });
-          task.outputs.push({
-            ts: new Date().toISOString(),
-            kind: "api_action_error",
-            content: msg,
-            meta: { action }
-          });
-          state.history.push({ ts: new Date().toISOString(), type: "api_action_error", taskId, error: msg, action });
-          await saveState(state);
-          logWarn(`API ERROR: ${msg}`);
-        }
+        if (!args.stream) emit.delta(stepText);
+        state.steps.push({ id: step.id, kind: "chat", title: step.title, ok: true, output: stepText });
+        emit.delta("\n\n");
       }
 
-      // Continue solver with new toolResults in context
-      continue;
+      const assess = await assessGoal({ prompt, args, emit, state, signal });
+      if (assess.done) {
+        emit.delta(`[solver] done: ${assess.reason}\n\n`);
+        // Final answer: use the last meaningful output if any; otherwise synthesize from state
+        const final = await lmChat({
+          baseUrl: args.baseUrl,
+          apiKey: args.lmApiKey,
+          body: {
+            model: args.model,
+            temperature: 0.2,
+            max_tokens: args.maxTokens,
+            stream: args.stream,
+            messages: [
+              {
+                role: "system",
+                content:
+`Write the final answer for the user using the completed state.
+Prefer human-readable results; do not include raw UUIDs unless unavoidable.`
+              },
+              { role: "user", content: `Prompt:\n${prompt}\n\nState:\n${truncate(state, 9000)}` }
+            ]
+          },
+          onDelta: args.stream ? (d) => emit.delta(d) : null,
+          signal
+        });
+
+        if (!args.stream) emit.delta(final);
+        return final;
+      }
     }
 
-    // No actions requested: finalize this turn based on status
-    if (status === "done") {
-      task.status = "done";
-      task.updatedAt = new Date().toISOString();
-      state.history.push({ ts: new Date().toISOString(), type: "task_done", taskId, confidence });
-      await saveState(state);
-      logOk(`Done: ${task.title} (conf ${confidence.toFixed(2)})`);
-      return;
-    }
+    if (replan === args.solverMaxReplans) break;
 
-    if (status === "needs_breakdown") {
-      if (task.depth >= state.config.maxDepth) {
-        task.status = "blocked";
-        task.blockers = ["Max depth reached; cannot further decompose. Treating as blocked."];
-        state.history.push({ ts: new Date().toISOString(), type: "task_blocked", taskId, reason: "max_depth" });
-        await saveState(state);
-        logWarn(`Blocked (max depth): ${task.title}`);
+    // Replan based on accumulated state/errors
+    emit.delta(`[replan] ${replan + 1}/${args.solverMaxReplans}\n`);
+    plan = await makeSolverPlan({
+      prompt: `${prompt}\n\nWe attempted steps and may be incomplete. Replan using this state:\n${truncate(state, 8000)}`,
+      args,
+      emit,
+      signal
+    });
+    emit.delta("\n");
+  }
+
+  // If still not done, produce best-effort final
+  const final = await lmChat({
+    baseUrl: args.baseUrl,
+    apiKey: args.lmApiKey,
+    body: {
+      model: args.model,
+      temperature: 0.2,
+      max_tokens: args.maxTokens,
+      stream: args.stream,
+      messages: [
+        {
+          role: "system",
+          content:
+`Provide the best possible answer. If incomplete, say what remains and what next tool call would resolve it.`
+        },
+        { role: "user", content: `Prompt:\n${prompt}\n\nState:\n${truncate(state, 9000)}` }
+      ]
+    },
+    onDelta: args.stream ? (d) => emit.delta(d) : null
+  });
+
+  if (!args.stream) emit.delta(final);
+  return final;
+}
+
+/* =========================
+   Main entry (CLI)
+   ========================= */
+
+async function runOneShot({ prompt, args }) {
+  const emit = createCliEmitter();
+  emit.delta(`[router] deciding…\n`);
+
+  const decision = await routeDecision({ prompt, args, emit });
+  emit.delta(`[router] route=${decision.route} reason=${decision.reason || ""}\n\n`);
+
+  if (decision.route === "chat") {
+    emit.started("cli");
+    const txt = await lmChat({
+      baseUrl: args.baseUrl,
+      apiKey: args.lmApiKey,
+      body: {
+        model: args.model,
+        temperature: args.temperature,
+        max_tokens: args.maxTokens,
+        stream: args.stream,
+        messages: [{ role: "user", content: prompt }]
+      },
+      onDelta: args.stream ? (d) => emit.delta(d) : null
+    });
+    emit.done("cli", txt);
+    return;
+  }
+
+  if (decision.route === "solver") {
+    emit.started("cli");
+    const txt = await runSolverRoute({ prompt, args, emit });
+    emit.done("cli", txt);
+    return;
+  }
+
+  // tool
+  emit.started("cli");
+  const txt = await runToolRoute({ prompt, args, emit });
+  emit.done("cli", txt);
+}
+
+/* =========================
+   Listen mode (WS control client)
+   ========================= */
+
+function computeBackoffMs(attempt) {
+  const base = Math.min(30_000, 500 * Math.pow(1.6, attempt));
+  const jitter = Math.floor(Math.random() * 400);
+  return base + jitter;
+}
+
+function startControlWsListener(args) {
+  const wsUrl = String(args.controlWsUrl || "").trim();
+  if (!wsUrl) die("Missing control.wsUrl in CONFIG (or pass --control-ws-url).");
+
+  let ws = null;
+  let reconnectAttempt = 0;
+
+  // Track in-flight cancel
+  const inflight = new Map(); // id -> AbortController
+
+  const wsSend = (obj) => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify(obj));
+  };
+
+  function connect() {
+    reconnectAttempt += 1;
+    const backoff = computeBackoffMs(reconnectAttempt - 1);
+    log("info", `Connecting to control WS: ${wsUrl} (attempt ${reconnectAttempt}, backoff ${backoff}ms)`);
+
+    ws = new WebSocket(wsUrl, {
+      headers: args.controlToken ? { "x-control-token": args.controlToken } : undefined
+    });
+
+    ws.on("open", () => {
+      reconnectAttempt = 0;
+      log("info", "WS connected.");
+
+      wsSend({
+        type: "hello",
+        client_id: `${os.hostname()}-${randomUUID().slice(0, 8)}`,
+        capabilities: {
+          models: true,
+          chat: true,
+          solver: true,
+          tool: true,
+          cancel: true
+        },
+        ts: Date.now()
+      });
+
+      wsSend({ type: "ping", ts: Date.now() });
+    });
+
+    ws.on("message", async (data) => {
+      const text = Buffer.isBuffer(data) ? data.toString("utf8") : String(data);
+      const parsed = safeJsonParse(text);
+      if (!parsed.ok) {
+        wsSend({ type: "error", id: null, error: { message: "bad_json" } });
         return;
       }
 
-      const children = [];
-      for (const st of subTasks.slice(0, 8)) {
-        const child = taskNodeFromModelTask(st, { parentId: task.id, depth: task.depth + 1 });
-        state.tasks[child.id] = child;
-        children.push(child.id);
-        task.children.push(child.id);
+      const msg = parsed.value;
+      const type = String(msg?.type || "");
+      const id = String(msg?.id || "");
+
+      if (type === "ping") { wsSend({ type: "pong", ts: Date.now() }); return; }
+      if (type === "pong") return;
+
+      if (type === "models") {
+        try {
+          const data = await lmListModels({ baseUrl: args.baseUrl, apiKey: args.lmApiKey });
+          wsSend({ type: "models", id, ok: true, data });
+        } catch (e) {
+          wsSend({ type: "models", id, ok: false, error: { message: e?.message || String(e) } });
+        }
+        return;
       }
 
-      task.status = "expanded";
-      task.updatedAt = new Date().toISOString();
-      state.history.push({ ts: new Date().toISOString(), type: "task_expanded", taskId, children });
-      await saveState(state);
+      if (type === "cancel") {
+        const controller = inflight.get(id);
+        if (controller) {
+          controller.abort();
+          inflight.delete(id);
+          wsSend({ type: "cancelled", id, ok: true });
+        } else {
+          wsSend({ type: "cancelled", id, ok: false, error: { message: "not_inflight" } });
+        }
+        return;
+      }
 
-      logInfo(`Expanded into ${children.length} subtask(s).`);
-      return;
-    }
+      if (type !== "chat") {
+        wsSend({ type: "error", id: id || null, error: { message: `unknown_type:${type}` } });
+        return;
+      }
 
-    if (status === "blocked") {
-      task.status = "blocked";
-      task.blockers = blockers.length ? blockers : ["Blocked with unspecified reasons."];
-      task.updatedAt = new Date().toISOString();
-      state.history.push({ ts: new Date().toISOString(), type: "task_blocked", taskId, blockers: task.blockers });
-      await saveState(state);
-      logWarn(`Blocked: ${task.title}`);
-      if (task.blockers.length) logWarn(`  blockers: ${task.blockers.join(" | ")}`);
-      return;
-    }
+      const body = msg?.body;
+      const messages = Array.isArray(body?.messages) ? body.messages : null;
+      if (!messages || messages.length === 0) {
+        wsSend({ type: "error", id, error: { message: "chat missing body.messages[]" } });
+        return;
+      }
 
-    if (status === "revise_plan") {
-      const issues = [
-        ...(Array.isArray(planFeedback?.suggested_changes) ? planFeedback.suggested_changes.map(String) : []),
-        ...(notes || [])
-      ].join("\n") || "LLM requested plan revision.";
-      lastIssues = issues;
+      // Convert messages to a single prompt for routing/solver/tool
+      const prompt = messages
+        .map((m) => `${String(m?.role || "user").toUpperCase()}: ${String(m?.content || "")}`)
+        .join("\n\n")
+        .trim();
 
-      task.status = "done";
-      task.updatedAt = new Date().toISOString();
-      state.history.push({ ts: new Date().toISOString(), type: "task_done_with_revision_request", taskId, issues });
-      await saveState(state);
+      const emit = createWsEmitter(ws, id);
+      const controller = new AbortController();
+      inflight.set(id, controller);
 
-      await maybeRevisePlan(state, issues);
-      return;
-    }
+      try {
+        emit.delta(`[router] deciding…\n`);
+        const decision = await routeDecision({ prompt, args, emit, signal: controller.signal });
+        emit.delta(`[router] route=${decision.route} reason=${decision.reason || ""}\n\n`);
+        emit.started();
 
-    // Unknown status: treat as blocked
-    task.status = "blocked";
-    task.blockers = [`Unknown status: ${String(status)}`];
-    state.history.push({ ts: new Date().toISOString(), type: "task_blocked", taskId, reason: "unknown_status" });
-    await saveState(state);
-    return;
+        if (decision.route === "chat") {
+          // Normal chat pass-through using the incoming messages
+          const txt = await lmChat({
+            baseUrl: args.baseUrl,
+            apiKey: args.lmApiKey,
+            body: {
+              model: body?.model || args.model,
+              messages,
+              temperature: body?.temperature ?? args.temperature,
+              max_tokens: body?.max_tokens ?? args.maxTokens,
+              stream: true
+            },
+            onDelta: (d) => emit.delta(d),
+            signal: controller.signal
+          });
+          emit.done(txt);
+          return;
+        }
+
+        if (decision.route === "solver") {
+          const txt = await runSolverRoute({ prompt, args, emit, signal: controller.signal });
+          emit.done(txt);
+          return;
+        }
+
+        const txt = await runToolRoute({ prompt, args, emit, signal: controller.signal });
+        emit.done(txt);
+      } catch (e) {
+        emit.error(e);
+      } finally {
+        inflight.delete(id);
+      }
+    });
+
+    ws.on("close", (code, reason) => {
+      log("warn", `WS closed code=${code} reason=${reason?.toString?.() || ""}`);
+      // cancel inflight
+      for (const [, controller] of inflight) controller.abort();
+      inflight.clear();
+      const wait = computeBackoffMs(reconnectAttempt);
+      setTimeout(connect, wait);
+    });
+
+    ws.on("error", (err) => {
+      log("warn", `WS error: ${err?.message || err}`);
+      // close handler will reconnect
+    });
   }
 
-  // If we exit inner loop, we ran out of turns—mark blocked with diagnostic
-  task.status = "blocked";
-  task.blockers = [`Max turns per task reached (${state.config.maxTurnsPerTask}). Last issues: ${lastIssues || "n/a"}`];
-  task.updatedAt = new Date().toISOString();
-  state.history.push({ ts: new Date().toISOString(), type: "task_blocked", taskId, reason: "max_turns" });
-  await saveState(state);
-  logWarn(`Blocked (max turns): ${task.title}`);
+  connect();
 }
 
-async function synthesizeFinal(state) {
-  logInfo("Synthesizing final answer...");
-  const completed = Object.values(state.tasks).filter(t => t.status === "done");
-  completed.sort((a, b) => a.depth - b.depth || a.createdAt.localeCompare(b.createdAt));
+/* =========================
+   Entrypoint
+   ========================= */
 
-  const payload = completed.map(t => {
-    const last = t.outputs?.slice?.(-1)?.[0];
-    return {
-      title: t.title,
-      depth: t.depth,
-      result: (last?.content || "").slice(0, 5000),
-      success_criteria: t.success_criteria
-    };
-  });
-
-  const messages = [
-    {
-      role: "system",
-      content:
-`You are a synthesis engine.
-Return ONLY JSON.
-
-Schema:
-{
-  "final_answer": "string",
-  "key_artifacts": ["string", ...],
-  "open_questions": ["string", ...],
-  "next_steps": ["string", ...]
-}
-
-Rules:
-- Use the completed task results as evidence.
-- If anything is uncertain, say so plainly.`
-    },
-    {
-      role: "user",
-      content:
-`Problem:
-${state.problem}
-
-Plan goal:
-${state.plan?.goal || ""}
-
-Completed task results:
-${JSON.stringify(payload, null, 2)}`
-    }
-  ];
-
-  const { content } = await chatCompletion({
-    baseUrl: state.config.baseUrl,
-    model: state.config.model,
-    temperature: Math.max(0.1, state.config.temperature),
-    messages
-  }, state);
-
-  const out = tryExtractJson(content);
-  const md =
-`# Final Answer
-
-${out.final_answer || ""}
-
-## Key Artifacts
-${(out.key_artifacts || []).map(x => `- ${x}`).join("\n")}
-
-## Open Questions
-${(out.open_questions || []).map(x => `- ${x}`).join("\n")}
-
-## Next Steps
-${(out.next_steps || []).map(x => `- ${x}`).join("\n")}
-`;
-
-  const finalMd = await writeArtifact(state, "final.md", md);
-  const finalJson = await writeArtifact(state, "final.json", JSON.stringify(out, null, 2));
-
-  state.final = { ts: new Date().toISOString(), ...out, files: { finalMd, finalJson } };
-  state.history.push({ ts: new Date().toISOString(), type: "final_synthesized", files: state.final.files });
-  await saveState(state);
-
-  logOk(`Wrote ${finalMd}`);
-  console.log("\n" + md);
-}
-
-// -----------------------------
-// Entry
-// -----------------------------
 async function main() {
-  const args = parseArgs(process.argv);
+  const args = parseArgs(process.argv.slice(2));
 
-  const config = {
-    // LM Studio
-    baseUrl: String(args["base-url"] || DEFAULTS.baseUrl),
-    model: String(args.model || DEFAULTS.model),
-    temperature: args.temperature != null ? Number(args.temperature) : DEFAULTS.temperature,
-
-    // recursion
-    maxDepth: args["max-depth"] != null ? Number(args["max-depth"]) : DEFAULTS.maxDepth,
-    maxSteps: args["max-steps"] != null ? Number(args["max-steps"]) : DEFAULTS.maxSteps,
-
-    // budgets
-    maxLlmCalls: args["max-llm-calls"] != null ? Number(args["max-llm-calls"]) : DEFAULTS.maxLlmCalls,
-    maxActions: args["max-actions"] != null ? Number(args["max-actions"]) : DEFAULTS.maxActions,
-    maxActionsPerTurn: args["max-actions-per-turn"] != null ? Number(args["max-actions-per-turn"]) : DEFAULTS.maxActionsPerTurn,
-    maxTurnsPerTask: args["max-turns-per-task"] != null ? Number(args["max-turns-per-task"]) : DEFAULTS.maxTurnsPerTask,
-
-    allowRevise: !args["no-revise"] && DEFAULTS.allowRevise,
-
-    // SURVEY-CAD API
-    apiBaseUrl: String(args["api-base-url"] || DEFAULTS.apiBaseUrl),
-    apiTimeoutMs: args["api-timeout-ms"] != null ? Number(args["api-timeout-ms"]) : DEFAULTS.apiTimeoutMs,
-    allowWrite: !!args["allow-write"],
-    allowWriteAny: !!args["allow-write-any"],
-  };
-
-  if (args["list-models"]) {
-    await listModels(config.baseUrl);
+  if (args.listen) {
+    startControlWsListener(args);
     return;
   }
 
-  let state;
-  if (args.resume) {
-    const p = path.resolve(String(args.resume));
-    logInfo(`Resuming from ${p}`);
-    const txt = await fsp.readFile(p, "utf8");
-    state = JSON.parse(txt);
-    state.config = { ...state.config, ...config };
-    // ensure new exec fields exist
-    state.exec = state.exec || {};
-    state.exec.llmCalls = Number(state.exec.llmCalls || 0);
-    state.exec.actionsTaken = Number(state.exec.actionsTaken || 0);
-    await saveState(state);
-  } else {
-    let problem = "";
-    if (args.stdin) {
-      problem = (await readStdinAll()).trim();
-    } else if (args._.length) {
-      problem = args._.join(" ").trim();
-    } else {
-      logErr('No problem provided. Use: node lmstudio-recursive-solver.mjs "..." or --stdin');
-      process.exitCode = 2;
-      return;
-    }
-    if (!problem) {
-      logErr("Problem is empty.");
-      process.exitCode = 2;
-      return;
-    }
+  if (!args.prompt) {
+    die(
+      `Usage:
+  node solver.js "question" [--base-url ...] [--model ...] [--api-base-url ...] [--allow-write]
+  node solver.js --listen [--control-ws-url ...] [--allow-write]
 
-    const outDir = path.resolve(String(args.out || path.join(process.cwd(), "runs", `run-${nowStamp()}`)));
-    ensureDirSync(outDir);
-    const stateFile = path.resolve(String(args.state || path.join(outDir, "state.json")));
-
-    state = newState({ problem, config, outDir, stateFile });
-    await saveState(state);
+Edit CONFIG at the top to avoid passing flags.`
+    );
   }
 
-  logInfo(`LM Studio base URL: ${state.config.baseUrl}`);
-  logInfo(`Model: ${state.config.model}`);
-  logInfo(`Out dir: ${state.outDir}`);
-  logInfo(`State file: ${state.stateFile}`);
-  logInfo(`SURVEY-CAD API base: ${state.config.apiBaseUrl}`);
-  logInfo(`API writes: ${state.config.allowWriteAny ? "ENABLED (ANY)" : (state.config.allowWrite ? "ENABLED (ALLOWLIST)" : "disabled")}`);
-
-  // Optional quick health check (GET only; safe)
-  try {
-    const health = await runApiAction(state, { type: "api_http", method: "GET", path: "/health", expect: "json", saveAs: "health" });
-    state.history.push({ ts: new Date().toISOString(), type: "api_health_check", artifact: health.artifact });
-    await saveState(state);
-    logOk("API health check OK.");
-  } catch (e) {
-    logWarn(`API health check failed (continuing): ${String(e?.message || e)}`);
-  }
-
-  if (!state.plan) {
-    await generatePlan(state);
-  } else {
-    logOk("Plan already exists (from state).");
-  }
-
-  // Execution loop
-  while (state.exec.stepsTaken < state.config.maxSteps) {
-    const nextId = pickNextTaskId(state);
-    if (!nextId) break;
-
-    state.exec.stepsTaken++;
-    await saveState(state);
-
-    await solveOneTask(state, nextId);
-
-    if (state.exec.stepsTaken % 3 === 0) {
-      await reflect(state);
-    }
-  }
-
-  const pending = Object.values(state.tasks).filter(t => t.status === "pending").length;
-  const blocked = Object.values(state.tasks).filter(t => t.status === "blocked").length;
-
-  if (pending > 0) logWarn(`Stopped with ${pending} pending task(s). (step budget reached or no runnable tasks)`);
-  if (blocked > 0) logWarn(`There are ${blocked} blocked task(s). Check state.json for blockers.`);
-
-  await synthesizeFinal(state);
+  await runOneShot({ prompt: args.prompt, args });
 }
 
 main().catch((e) => {
-  logErr(e?.stack || e?.message || String(e));
-  process.exitCode = 1;
+  console.error(e?.stack || e?.message || String(e));
+  process.exit(1);
 });
+
