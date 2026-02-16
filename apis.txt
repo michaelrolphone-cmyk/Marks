@@ -1,0 +1,314 @@
+SERVER API + SERVER WS CATALOG (launcher-derived + your original list)
+No cross-app iframe messaging, no localStorage/sessionStorage keys.
+
+HEALTH
+
+1. GET /health
+   Purpose: liveness check.
+   Returns: JSON { ok: true }
+
+APPS
+
+2. GET /api/apps
+   Purpose: returns app catalog used by the launcher.
+   Returns: JSON object with field "apps": array.
+
+   Top-level shape (minimum observed/assumed by launcher):
+
+* { apps: AppEntry[] }
+
+  Each app entry is expected to include at least:
+* entryHtml (string)
+* name (string)
+* iconPath (string)
+
+  Optional/commonly present:
+* description (string)
+* section (string)
+* experimental (boolean)
+* iconHeight (number)
+* id (string)
+
+  Notes (launcher-derived):
+* launcher filters out any app whose entryHtml is "index.html" (case-insensitive)
+* launcher treats entryHtml as the iframe entry file (path-like string)
+
+LAUNCHER DATA MODELS (nested data structures used by the launcher)
+
+PROJECTS (launcher-managed list; not a server endpoint)
+Purpose: projects power the “Project manager” UI and drive background PLSS/map lookups.
+
+In-memory shape:
+
+* projects: Project[]   (loaded on startup; used throughout render/save flows)
+* activeProjectId: string|null
+
+Project object shape (fields observed/created/updated by launcher):
+
+* id: string
+* name: string
+* client: string
+* clientContact: string
+* billingRate: string (stored as text from input; may be empty)
+* address: string
+* description: string
+
+PLSS/index fields (some user-entered, some backfilled):
+
+* tsr: string                     (user-entered TSR; also used as townshipRange)
+* section: string                 (user-entered section number text)
+* sections: string[]              (launcher normalizes to [section] or [])
+* townshipRange: string           (computed/filled from /api/lookup response)
+* aliquotLabel: string            (human label computed from /api/aliquots first code)
+* plssDescription: string         (typically: `${townshipRange} ${aliquotLabel}` when present)
+* surveyIndex: string             (launcher-built index number string)
+
+Control/meta:
+
+* manualPlssOverride: boolean     (true if user edited tsr/section manually)
+* status: string                  (must be one of PROJECT_STATUS_SEQUENCE; else coerced to "Proposed")
+* createdAt: ISO string
+* updatedAt: ISO string (set on edits/status advances/backfills)
+
+Status enumeration (PROJECT_STATUS_SEQUENCE):
+
+* Proposed
+* Researched
+* Calculated
+* Tied
+* Drafted
+* Pin Set
+* Final Drafted
+* Submitted
+* Recorded
+* Billed
+* Paid
+* Archived
+
+PLSS metadata backfill flow (nested derived object; launcher-internal):
+When a project has an address and NOT manualPlssOverride, launcher may populate:
+
+* { townshipRange, tsr, section, aliquotLabel, plssDescription, surveyIndex }
+
+Derived from server calls (in this order):
+
+* /api/lookup?address=...  -> township/section attributes + location {lat,lon}
+* /api/aliquots?lon=...&lat=... -> first aliquot code -> aliquotLabel + aliquot sequence
+* surveyIndex built from: township/range/section + aliquot sequence + (optional) plat book/pages if present on project
+
+Notes on nested aliquot parsing used for surveyIndex:
+
+* launcher normalizes aliquot code to NSEW tokens (e.g., NE/NW/SE/SW pairs)
+* launcher uses first pair as “sectionQuadrant”, remaining pairs as “aliquots”
+
+GEOSPATIAL
+
+3. GET /api/geocode?address=...
+   Purpose: convert a human address into coordinates (used by launcher for map background lookup).
+   Query:
+
+* address: string (required)
+
+  Returns (assumed by launcher):
+* { lat: number, lon: number }
+
+4. GET /api/lookup?address=...
+   Purpose: address lookup that returns a location plus PLSS feature context (township/section).
+   Query:
+
+* address: string (required)
+
+  Returns (assumed by launcher, minimum):
+
+* location: { lat: number, lon: number }
+
+* section: FeatureLike
+
+* township: FeatureLike
+
+  FeatureLike shape (minimum used by launcher):
+
+* { attributes: object, geometry?: object, ... }
+
+  Notes: launcher tolerates many possible attribute key names for township/range/section fields.
+  Attribute keys explicitly probed by launcher include:
+
+* Township number: TWNSHPNO, TOWNSHIP, TWP, TWP_NO (fallback pattern: /TWP|TOWNSHIP|TWNSHP/i)
+
+* Township direction: TWNSHPDIR, TOWNSHPDIR, TWPDIR, TOWNSHIP_DIR, TDIR (fallback pattern: /TWP.*DIR|TOWNSHIP.*DIR|TWNSHP.*DIR/i)
+
+* Range number: RANGENO, RANGE, RNG, RANGE_NO (fallback pattern: /RNG|RANGE/i)
+
+* Range direction: RANGEDIR, RNGDIR, RANGE_DIR, RDIR (fallback pattern: /RANGE.*DIR|RNG.*DIR/i)
+
+* Section number: SEC, SECTION, SECNO (fallback pattern: /SEC|SECTION/i)
+
+* Section parsing note: launcher also accepts values containing embedded text like "SEC 12" / "SECTION #12"
+
+5. GET /api/parcel?lon=...&lat=...&outSR=4326&searchMeters=40
+   Purpose: find parcel feature(s) near a coordinate.
+   Query:
+
+* lon: number
+* lat: number
+* outSR: spatial reference WKID (default example 4326)
+* searchMeters: number (default example 40)
+
+  Returns:
+* implementation-defined; typically feature-set shaped. Launcher file provided does not consume this response.
+
+6. GET /api/section?lon=...&lat=...
+   Purpose: find PLSS section feature for a coordinate.
+   Query:
+
+* lon: number
+* lat: number
+
+  Returns:
+* implementation-defined; typically feature-like. Launcher file provided does not consume this response directly (only /api/lookup does).
+
+7. GET /api/aliquots?lon=...&lat=...&outSR=4326
+   Purpose: find aliquot (quarter/quarter-quarter) feature(s) for a coordinate.
+   Query:
+
+* lon: number
+* lat: number
+* outSR: spatial reference WKID (optional; launcher calls without outSR)
+
+  Returns (assumed by launcher, minimum):
+* { aliquots: FeatureLike[] }
+* FeatureLike: { attributes: { ALIQUOT?: string, NAME?: string, ... }, geometry?: object, ... }
+
+  Notes (launcher-derived):
+* launcher selects the FIRST non-empty aliquot code from:
+
+  * feature.attributes.ALIQUOT
+  * else feature.attributes.NAME
+* launcher expects aliquot code strings that can be normalized to NSEW quarter tokens
+* launcher derives a quarter-sequence only when the normalized code length is even and all 2-char parts are in {NE,NW,SE,SW}
+
+8. GET /api/subdivision?lon=...&lat=...&outSR=4326
+   Purpose: find subdivision/plat feature(s) for a coordinate.
+   Query:
+
+* lon: number
+* lat: number
+* outSR: spatial reference WKID
+
+  Returns:
+* implementation-defined; typically feature-set shaped. Launcher file provided does not consume this response.
+
+9. GET /api/static-map?lon=...&lat=...&address=...
+   Purpose: generate a static map image URL (launcher uses as a background image).
+   Query (launcher usage):
+
+* lat: number (formatted to 6 decimals)
+* lon: number (formatted to 6 decimals)
+* address: string (optional)
+
+  Returns:
+* image response or redirect to image (launcher treats it as an image URL)
+
+UTILITIES
+
+10. GET /api/utilities?address=...&outSR=2243&sources=power,water
+    Purpose: fetch utility records/maps for an address.
+    Query:
+
+* address: string
+* outSR: WKID (example 2243)
+* sources: comma list (example power,water)
+
+PROJECT FILE
+
+11. GET /api/project-file/template?projectName=...&client=...&address=...&resources=[...]
+    Purpose: generate a project-file template prefilled with basic metadata and resource list.
+    Query:
+
+* projectName: string
+* client: string
+* address: string
+* resources: array-ish serialized value (implementation-defined; doc should specify exact encoding)
+
+12. POST /api/project-file/compile
+    Purpose: compile a project file into an output bundle/artifacts.
+    Body accepted (as you specified):
+
+* { projectFile: {...} } OR { project: {...} }
+
+  Returns:
+* compiled result (implementation-defined; doc should specify output fields)
+
+FIELD-TO-FINISH
+
+13. GET /api/fld-config?file=config/MLS.fld
+    Purpose: retrieve an FLD configuration file (field-to-finish rules).
+    Query:
+
+* file: string path (example config/MLS.fld)
+
+  Returns:
+* config content (JSON or text; implementation-defined)
+
+LOCALSTORAGE SYNC (SERVER)
+
+14. GET /api/localstorage-sync
+    Purpose: fetch current server snapshot/version for sync.
+    Returns:
+
+* implementation-defined, but POST implies server tracks {version, snapshot}
+
+15. POST /api/localstorage-sync
+    Purpose: push a snapshot to server for sync.
+    Body:
+
+* { version: number, snapshot: object }
+
+ROS / OCR
+
+16. POST /extract
+    Purpose: run OCR/extraction pipeline on uploaded content (survey ROS extraction).
+    Body:
+
+* implementation-defined (doc should specify multipart vs JSON, required fields, and outputs)
+
+17. GET /api/ros-pdf?url=...
+    Purpose: fetch/proxy a ROS PDF by URL (likely for CORS-safe access).
+    Query:
+
+* url: string (required)
+
+WEBSOCKETS (SERVER)
+
+18. WS /ws/localstorage-sync
+    Purpose: realtime diff sync channel for localstorage sync.
+    Message schema:
+
+* not specified in launcher file; should be documented where implemented.
+
+19. WS /ws/lineforge?room=...
+    Purpose: realtime collaboration channel for LineForge/LineSmith.
+    Query:
+
+* room: string (required/expected)
+
+20. WS /ws/crew-presence
+    Purpose: realtime presence channel for which crew members are online.
+
+Server -> client messages (as you provided + confirmed by launcher):
+
+* { type: "crew-presence-welcome", online: [crewMemberId, ...] }
+* { type: "crew-presence-update",  online: [crewMemberId, ...] }
+
+Client -> server message (found in launcher file; server-side contract):
+
+* { type: "crew-presence-identify", crewMemberId: string|null }
+
+Notes:
+
+* crewMemberId can be null when user hasn’t selected an identity.
+* server should handle identify messages and associate sockets with crewMemberId.
+
+“HUMAN READABLE” NOTE (server-related dependency)
+If you only have crewMemberId UUIDs, fetch crew list from your crew API endpoint (commonly GET /api/crew) and map IDs to names.
+(Endpoint not present in this launcher file; include it in the server catalog if it exists.)
