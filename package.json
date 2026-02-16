@@ -1,0 +1,14 @@
+{
+  "name": "lmstudio-proxy-client",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "main": "lmstudio-proxy-client.js",
+  "scripts": {
+    "start": "node lmstudio-proxy-client.js"
+  },
+  "dependencies": {
+    "ws": "^8.17.0"
+  }
+}
+
