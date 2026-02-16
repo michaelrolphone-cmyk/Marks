@@ -1,3 +1,5 @@
+My current version looks like this, its the stable snapshot:
+
 #!/usr/bin/env node
 /**
  * solver.js — LM Studio “tool + solver” agent that can run:
@@ -54,11 +56,11 @@ const CONFIG = {
     allowWrite: false,
 
     // retry behavior when tool calls fail
-    toolRepairRounds: 3,
+    toolRepairRounds: 5,
 
     // solver decomposition depth
-    solverMaxSteps: 6,
-    solverMaxReplans: 2
+    solverMaxSteps: 15,
+    solverMaxReplans: 12
   },
 
   timeouts: {
@@ -1410,4 +1412,3 @@ main().catch((e) => {
   console.error(e?.stack || e?.message || String(e));
   process.exit(1);
 });
-
