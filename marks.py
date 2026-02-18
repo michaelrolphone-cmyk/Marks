@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
 """
-Marks — OpenAPI HTTP + WebSocket agent CLI (LM Studio) using OpenAI-compatible tool calling.
+Marks — OpenAPI HTTP + WebSocket + Local CLI tools (Gmailwrap) agent CLI (LM Studio) using OpenAI-compatible tool calling.
 
-Key fixes in this version:
+Key behaviors:
 - HTTP tools accept BOTH:
     - {"json_body": {...}}   (preferred)
     - flat args {...}        (fallback => treated as JSON body for POST/PUT/PATCH/DELETE)
-  This prevents empty-body 400s when the model ignores the schema.
+- RESOLVE (read-only) → EXECUTE (write) → VERIFY (read back) workflow
 
-- Generic "resolved target" hint:
-  If RESOLVE reads a list of people-like objects (id + firstName/lastName) and the request
-  mentions a person, we pick the best match and inject a reminder to update ONLY that record.
-
-- Generic "wrong-target write" guard:
-  If a resolved target exists, blocks writes whose body clearly references a different id/name.
-
-Still enforces:
-- RESOLVE (read-only) → EXECUTE (write) → VERIFY (read back)
+Additions in this version:
+- Local Gmailwrap tools:
+    - gmail_list(folder="INBOX", page=1, pageSize=10)
+    - gmail_read(id)
+    - gmail_send(to, subject, body)
+- Action gate:
+    Blocks ANY modifying/deleting/emailing actions unless `--gate ALLOW` is passed.
+    This includes:
+      - HTTP POST/PUT/PATCH/DELETE
+      - ws_send
+      - gmail_send
 """
 
 import argparse
@@ -28,6 +30,7 @@ import sys
 import threading
 import time
 import uuid
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -412,7 +415,7 @@ def build_http_tools(prefix: str, spec: Dict[str, Any], base_url: str, default_h
             canonical = f"{prefix}__{m.upper()}__{name_tail}"
             alias = f"{prefix}_{m}_{name_tail}"
 
-            # NOTE: allow additionalProperties=True so models can send flat bodies without schema fights
+            # allow additionalProperties=True so models can send flat bodies without schema fights
             parameters = {
                 "type": "object",
                 "properties": {
@@ -699,6 +702,159 @@ def build_generic_ws_tools(ws_manager: WSManager) -> List[ToolDef]:
 
 
 # ---------------------------
+# Local Gmailwrap tools
+# ---------------------------
+
+def _extract_json_from_text(text: str) -> Optional[Any]:
+    """
+    Try to parse JSON from stdout even if extra text is present.
+    """
+    if not text:
+        return None
+    t = text.strip()
+    try:
+        return json.loads(t)
+    except Exception:
+        pass
+    # find first { or [
+    start = None
+    for i, ch in enumerate(t):
+        if ch in "{[":
+            start = i
+            break
+    if start is None:
+        return None
+    # find last } or ]
+    end = None
+    for i in range(len(t) - 1, -1, -1):
+        if t[i] in "}]":
+            end = i
+            break
+    if end is None or end <= start:
+        return None
+    frag = t[start:end + 1]
+    try:
+        return json.loads(frag)
+    except Exception:
+        return None
+
+
+def _run_gmailwrap(gmailwrap_path: str, argv: List[str], timeout_s: int = 60) -> Dict[str, Any]:
+    cmd = ["node", gmailwrap_path] + argv
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=max(1, int(timeout_s)))
+    except Exception as e:
+        return {"ok": False, "error": f"gmailwrap exec failed: {e}", "cmd": " ".join(cmd)}
+
+    out = (p.stdout or "").strip()
+    err = (p.stderr or "").strip()
+    parsed = _extract_json_from_text(out)
+
+    if isinstance(parsed, dict) and "ok" in parsed:
+        # trust wrapper's ok/error schema
+        if err and "stderr" not in parsed:
+            parsed["stderr"] = err[:4000]
+        return parsed
+
+    # wrapper didn’t return JSON; synthesize
+    ok = (p.returncode == 0)
+    res: Dict[str, Any] = {"ok": ok, "code": p.returncode, "cmd": " ".join(cmd)}
+    if parsed is not None:
+        res["json"] = parsed
+    if out:
+        res["stdout"] = out[:12000]
+    if err:
+        res["stderr"] = err[:12000]
+    if not ok and "error" not in res:
+        res["error"] = "gmailwrap returned non-zero exit code"
+    return res
+
+
+def build_gmailwrap_tools(gmailwrap_path: str) -> List[ToolDef]:
+    gmailwrap_path = os.path.abspath(gmailwrap_path)
+
+    def gmail_list(args: Dict[str, Any]) -> Dict[str, Any]:
+        args = args or {}
+        folder = str(args.get("folder") or "INBOX")
+        page = int(args.get("page") or 1)
+        page_size = int(args.get("pageSize") or args.get("page_size") or 10)
+        timeout_s = int(args.get("timeout_s") or 60)
+        return _run_gmailwrap(gmailwrap_path, ["list", folder, str(page), str(page_size)], timeout_s=timeout_s)
+
+    def gmail_read(args: Dict[str, Any]) -> Dict[str, Any]:
+        args = args or {}
+        mid = args.get("id") or args.get("message_id")
+        if not mid:
+            return {"ok": False, "error": "id required"}
+        timeout_s = int(args.get("timeout_s") or 60)
+        return _run_gmailwrap(gmailwrap_path, ["read", str(mid)], timeout_s=timeout_s)
+
+    def gmail_send(args: Dict[str, Any]) -> Dict[str, Any]:
+        args = args or {}
+        to = args.get("to")
+        subject = args.get("subject")
+        body = args.get("body")
+        if body is None:
+            body = args.get("text") or args.get("message") or args.get("content") or ""
+        if isinstance(body, list):
+            body = "\n".join(str(x) for x in body)
+        if not to or not subject:
+            return {"ok": False, "error": "to and subject required"}
+        timeout_s = int(args.get("timeout_s") or 90)
+        return _run_gmailwrap(gmailwrap_path, ["send", str(to), str(subject), str(body)], timeout_s=timeout_s)
+
+    tools: List[ToolDef] = [
+        ToolDef(
+            name="gmail_list",
+            description="List email envelopes. Args: folder (default INBOX), page (default 1), pageSize (default 10).",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "folder": {"type": "string", "default": "INBOX"},
+                    "page": {"type": "integer", "default": 1},
+                    "pageSize": {"type": "integer", "default": 10},
+                    "timeout_s": {"type": "integer", "default": 60},
+                },
+                "required": [],
+                "additionalProperties": True,
+            },
+            fn=gmail_list,
+        ),
+        ToolDef(
+            name="gmail_read",
+            description="Read an email by id.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "timeout_s": {"type": "integer", "default": 60},
+                },
+                "required": ["id"],
+                "additionalProperties": True,
+            },
+            fn=gmail_read,
+        ),
+        ToolDef(
+            name="gmail_send",
+            description="Send an email. Args: to, subject, body.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "to": {"type": "string"},
+                    "subject": {"type": "string"},
+                    "body": {"type": "string"},
+                    "timeout_s": {"type": "integer", "default": 90},
+                },
+                "required": ["to", "subject", "body"],
+                "additionalProperties": True,
+            },
+            fn=gmail_send,
+        ),
+    ]
+    return tools
+
+
+# ---------------------------
 # policy helpers
 # ---------------------------
 
@@ -706,10 +862,16 @@ WRITE_HINTS = ("set ", "update ", "change ", "modify ", "assign ", "grant ", "re
 
 def is_write_request(user_request: str) -> bool:
     s = (user_request or "").strip().lower()
+    # include email-ish requests as writes
+    if re.match(r"^(e-?mail|send|message|notify|mail)\b", s):
+        return True
     return s.startswith(WRITE_HINTS) or any(w in s for w in (" update", " set ", " change ", " modify ", " assign "))
 
 def is_update_intent(user_request: str) -> bool:
     s = (user_request or "").strip().lower()
+    # emailing is a write, but not an "update entity" workflow that requires lookup
+    if re.match(r"^(e-?mail|send|message|notify|mail)\b", s):
+        return False
     if s.startswith(("add ", "create ", "new ", "register ")):
         return False
     return ("set " in s) or ("update" in s) or ("change" in s) or ("modify" in s) or ("assign" in s)
@@ -764,10 +926,18 @@ def is_ws_read_tool(name: str) -> bool:
 def is_ws_write_tool(name: str) -> bool:
     return name == "ws_send"
 
+def is_local_read_tool(name: str) -> bool:
+    return name in ("gmail_list", "gmail_read")
+
+def is_local_write_tool(name: str) -> bool:
+    return name in ("gmail_send",)
+
 def allowed_in_resolve(name: str) -> bool:
     if is_http_tool(name):
         return is_http_read_tool(name)
     if is_ws_connect_tool(name) or name in ("ws_recv", "ws_connections", "ws_close"):
+        return True
+    if is_local_read_tool(name):
         return True
     return False
 
@@ -913,7 +1083,7 @@ def make_system_prompt(phase: str, tool_index: str) -> str:
         f"Current phase: {phase}\n"
         + (
             "RESOLVE phase rules:\n"
-            "- Use ONLY read tools (HTTP GET, WS_CONNECT, ws_recv, ws_connections, ws_close).\n"
+            "- Use ONLY read tools (HTTP GET, WS_CONNECT, ws_recv, ws_connections, ws_close, gmail_list, gmail_read).\n"
             "- Do NOT call write tools.\n"
             "- Goal: gather identifiers/current state needed for the write.\n"
             "When you have enough information AND you have performed at least one successful READ tool call, say exactly: RESOLVE_COMPLETE\n"
@@ -938,12 +1108,20 @@ def summarize_tool_result(tool_name: str, result_obj: Any) -> str:
             return f"{tool_name} -> ok={ok} messages={n}"
         if tool_name.startswith("ws_") or "WS_CONNECT" in tool_name or "_ws_connect_" in tool_name:
             return f"{tool_name} -> ok={result_obj.get('ok')}"
+        if tool_name.startswith("gmail_"):
+            return f"{tool_name} -> ok={result_obj.get('ok')}"
     return f"{tool_name} -> (result)"
 
 
 # ---------------------------
 # staged run with guards
 # ---------------------------
+
+def _is_action_gated_write_tool(name: str) -> bool:
+    if not name:
+        return False
+    return is_http_write_tool(name) or is_ws_write_tool(name) or is_local_write_tool(name)
+
 
 def run_phase(
     client: OpenAICompat,
@@ -958,6 +1136,10 @@ def run_phase(
     lookup_evidence: Dict[str, Any],
     track_write: Dict[str, Any],
     verify_pair: Tuple[Optional[str], Optional[str]],
+    action_gate_on: bool,
+    action_gate_unlocked: bool,
+    user_write_req: bool,
+    user_update_intent: bool,
 ) -> None:
     tool_map = {t.name: t for t in tool_defs}
     openai_tools = tool_defs_to_openai_tools(tool_defs)
@@ -991,7 +1173,7 @@ def run_phase(
                 messages.append({"role": "user", "content": "You said RESOLVE_COMPLETE, but you have not performed a successful READ tool call yet. Call a READ tool now, then say RESOLVE_COMPLETE."})
                 continue
 
-            messages.append({"role": "user", "content": "Continue resolving by calling a READ tool (HTTP GET or WS_CONNECT+ws_recv). Do NOT write. When ready, say RESOLVE_COMPLETE."})
+            messages.append({"role": "user", "content": "Continue resolving by calling a READ tool (HTTP GET or WS_CONNECT+ws_recv or gmail_list/gmail_read). Do NOT write. When ready, say RESOLVE_COMPLETE."})
             continue
 
         if not tool_calls:
@@ -1016,25 +1198,30 @@ def run_phase(
             except Exception:
                 args = {}
 
-            # Phase restriction
+            # Phase restriction (resolve-only)
             if phase.upper() == "RESOLVE" and name and (not allowed_in_resolve(name)):
                 result_obj = {"ok": False, "error": f"Tool '{name}' disabled in RESOLVE phase. Use READ tools only."}
                 if debug:
                     log("tool", f"BLOCKED {name} (resolve-only)", True)
 
+            # Action gate for any write/modify/email/delete actions
+            elif action_gate_on and name and _is_action_gated_write_tool(name) and not action_gate_unlocked:
+                result_obj = {"ok": False, "error": "Action gate locked. Re-run with --gate ALLOW to permit modifications/deletes/emails."}
+                if debug:
+                    log("tool", f"BLOCKED {name} (action gate locked)", True)
+
             # Write guard for updates: must have a successful read first
-            elif require_lookup_before_write and name and is_http_write_tool(name) and not lookup_evidence.get("has_read_ok"):
-                result_obj = {"ok": False, "error": "Write blocked: you must first read/resolve existing data (use HTTP GET or WS_CONNECT+ws_recv) before writing."}
+            elif require_lookup_before_write and name and (is_http_write_tool(name) or is_ws_write_tool(name) or is_local_write_tool(name)) and not lookup_evidence.get("has_read_ok"):
+                result_obj = {"ok": False, "error": "Write blocked: you must first read/resolve existing data (use HTTP GET or WS_CONNECT+ws_recv or gmail_list/gmail_read) before writing."}
                 if debug:
                     log("tool", f"BLOCKED {name} (lookup required)", True)
 
-            # Wrong-target guard when we resolved a person target
+            # Wrong-target guard when we resolved a person target (HTTP writes only)
             elif require_lookup_before_write and name and is_http_write_tool(name) and lookup_evidence.get("resolved_target") is not None:
                 target = lookup_evidence["resolved_target"]
                 method = infer_http_method_from_tool_name(name) or "post"
                 _, _, _, jb, _ = normalize_http_tool_args(method, args)
 
-                # Only apply if body looks like it's editing a person-ish record
                 if isinstance(jb, dict):
                     tid = target.get("id")
                     tfn = (target.get("firstName") or "").strip().lower()
@@ -1047,7 +1234,6 @@ def run_phase(
                     mismatch = False
                     if tid and bid and str(bid) != str(tid):
                         mismatch = True
-                    # If body supplies a name, require it match target
                     if (bfn or bln) and ((tfn and bfn and bfn != tfn) or (tln and bln and bln != tln)):
                         mismatch = True
 
@@ -1095,11 +1281,10 @@ def run_phase(
 
             # Evidence tracking
             if isinstance(result_obj, dict) and result_obj.get("ok") is True:
-                if name and (is_http_read_tool(name) or is_ws_read_tool(name)):
+                if name and (is_http_read_tool(name) or is_ws_read_tool(name) or is_local_read_tool(name)):
                     lookup_evidence["has_read_ok"] = True
                     lookup_evidence["last_read"] = result_obj
 
-                    # attempt to resolve a person target if not already
                     if lookup_evidence.get("resolved_target") is None:
                         try:
                             candidate = find_resolved_person_target(messages[1]["content"], result_obj.get("json") or result_obj)
@@ -1108,12 +1293,18 @@ def run_phase(
                         except Exception:
                             pass
 
-                if name and (is_http_write_tool(name) or is_ws_write_tool(name)):
+                if name and (is_http_write_tool(name) or is_ws_write_tool(name) or is_local_write_tool(name)):
                     track_write["did_write"] = True
                     track_write["write_ok"] = True
                     track_write["last_write"] = result_obj
 
-                if track_write.get("did_write") and name and (is_http_read_tool(name) or is_ws_read_tool(name)):
+                    # For gmail_send: treat success as verified (no deterministic read-back)
+                    if name == "gmail_send":
+                        track_write["did_verify_read"] = True
+                        track_write["verified_match"] = True
+                        track_write["verification_read"] = result_obj
+
+                if track_write.get("did_write") and name and (is_http_read_tool(name) or is_ws_read_tool(name) or is_local_read_tool(name)):
                     track_write["did_verify_read"] = True
                     field, value = verify_pair
                     if field and value:
@@ -1131,13 +1322,18 @@ def run_phase(
                 "content": json.dumps(result_obj, ensure_ascii=False),
             })
 
+        # If this is a write request that does NOT need "update intent" lookup (like sending an email),
+        # and we have at least one successful READ, end RESOLVE immediately to avoid repeated blocked writes.
+        if phase.upper() == "RESOLVE" and user_write_req and (not user_update_intent) and lookup_evidence.get("has_read_ok"):
+            return
+
 
 # ---------------------------
 # main
 # ---------------------------
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Marks — tool-calling agent for HTTP + WS specs (LM Studio)")
+    ap = argparse.ArgumentParser(description="Marks — tool-calling agent for HTTP + WS specs + local Gmailwrap (LM Studio)")
     ap.add_argument("request", type=str, help="User request")
     ap.add_argument("specs", nargs="+", help="One or more JSON spec files (HTTP and/or WS)")
 
@@ -1165,10 +1361,22 @@ def main() -> None:
     ap.add_argument("--execute-steps", type=int, default=20, help="Max steps for EXECUTE phase")
     ap.add_argument("--no-write-guard", action="store_true", help="Disable 'must have successful write' gate")
     ap.add_argument("--no-verify-guard", action="store_true", help="Disable 'must verify by read-back' gate")
+
+    # Local Gmailwrap + action gate
+    ap.add_argument("--gmailwrap", default=os.environ.get("MARKS_GMAILWRAP", ""),
+                    help="Path to gmailwrap.mjs (Node script). Enables gmail_list/gmail_read/gmail_send tools.")
+    ap.add_argument("--gate", default=os.environ.get("MARKS_GATE", ""),
+                    help="Unlock modifying/deleting/emailing actions. Use: --gate ALLOW")
+
     args = ap.parse_args()
 
     debug = not args.no_debug
     trace = bool(args.trace)
+
+    # Action gate: ON by default; unlocked only with ALLOW
+    action_gate_on = True
+    action_gate_unlocked = (str(args.gate).strip().upper() == "ALLOW")
+    log("policy", f"action_gate=on unlocked={action_gate_unlocked}", True)
 
     default_headers: Dict[str, str] = {}
     if args.bearer:
@@ -1233,6 +1441,12 @@ def main() -> None:
             log("init", f"WS connect tools for {prefix}: {len(ws_tools)} (base={ws_base or 'None'})", True)
 
     all_tools.extend(build_generic_ws_tools(ws_manager))
+
+    if args.gmailwrap:
+        gmail_tools = build_gmailwrap_tools(args.gmailwrap)
+        all_tools.extend(gmail_tools)
+        log("init", f"Local Gmail tools loaded from {args.gmailwrap}", True)
+
     log("init", f"Total tools loaded: {len(all_tools)} from {len(args.specs)} spec file(s)", True)
 
     uniq_names = []
@@ -1257,7 +1471,7 @@ def main() -> None:
     messages: List[Dict[str, Any]] = [
         {"role": "system", "content": make_system_prompt("RESOLVE", tool_index)},
         {"role": "user", "content": user_request},
-        {"role": "user", "content": "First: call the single most relevant READ tool (HTTP GET, or WS_CONNECT+ws_recv). Do NOT write yet."},
+        {"role": "user", "content": "First: call the single most relevant READ tool (HTTP GET, or WS_CONNECT+ws_recv, or gmail_list/gmail_read). Do NOT write yet."},
     ]
 
     run_phase(
@@ -1273,6 +1487,10 @@ def main() -> None:
         lookup_evidence=lookup_evidence,
         track_write=track_write,
         verify_pair=(verify_field, verify_value),
+        action_gate_on=action_gate_on,
+        action_gate_unlocked=action_gate_unlocked,
+        user_write_req=write_req,
+        user_update_intent=update_intent,
     )
 
     # Inject resolved target hint (generic, only if we actually found one)
@@ -1308,11 +1526,16 @@ def main() -> None:
         lookup_evidence=lookup_evidence,
         track_write=track_write,
         verify_pair=(verify_field, verify_value),
+        action_gate_on=action_gate_on,
+        action_gate_unlocked=action_gate_unlocked,
+        user_write_req=write_req,
+        user_update_intent=update_intent,
     )
 
     # Final answer step + hard gates
     if write_req and not args.no_write_guard and not track_write.get("write_ok"):
-        messages.append({"role": "user", "content": "You have not completed a confirmed successful write. Use tools to do the write, then verify by reading back."})
+        messages.append({"role": "user", "content": "You have not completed a confirmed successful write. Use tools to do the write, then verify by reading back (or for email, ensure send succeeded)."})
+
     if write_req and not args.no_verify_guard and not track_write.get("verified_match"):
         messages.append({"role": "user", "content": "You must verify the change by reading back and confirming it. Then provide the final result."})
 
@@ -1332,9 +1555,9 @@ def main() -> None:
     final = clean_model_text(msg.get("content") or "")
 
     if write_req and not args.no_write_guard and not track_write.get("write_ok"):
-        final = "I could not complete the requested update because no confirmed successful write occurred via tools."
+        final = "I could not complete the requested action because no confirmed successful write occurred via tools."
     elif write_req and not args.no_verify_guard and not track_write.get("verified_match"):
-        final = "A write may have been attempted, but I could not verify the change by reading it back successfully."
+        final = "A write may have been attempted, but I could not verify the result successfully."
 
     print("\n" + "=" * 60)
     print(final if final else "Done.")
