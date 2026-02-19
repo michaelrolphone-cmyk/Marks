@@ -1,0 +1,955 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Marks Platform API",
+    "version": "1.0.0",
+    "description": "HTTP API surface for the Marks platform server endpoints referenced by the launcher and automation clients."
+  },
+  "servers": [
+    {
+      "url": "http://localhost:3000",
+      "description": "Local development server"
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "summary": "Health check",
+        "operationId": "getHealth",
+        "responses": {
+          "200": {
+            "description": "Service is alive",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/apps": {
+      "get": {
+        "summary": "List launcher apps",
+        "operationId": "listApps",
+        "responses": {
+          "200": {
+            "description": "App catalog",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AppCatalogPayload"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/geocode": {
+      "get": {
+        "summary": "Geocode an address",
+        "operationId": "geocodeAddress",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AddressParam"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Coordinates",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GeocodePayload"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing/invalid address"
+          }
+        }
+      }
+    },
+    "/api/lookup": {
+      "get": {
+        "summary": "Lookup location and PLSS context",
+        "operationId": "lookupAddress",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AddressParam"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Location with township/section context",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LookupPayload"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/parcel": {
+      "get": {
+        "summary": "Find parcel near coordinates",
+        "operationId": "getParcel",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/LonParam"
+          },
+          {
+            "$ref": "#/components/parameters/LatParam"
+          },
+          {
+            "$ref": "#/components/parameters/OutSRParam"
+          },
+          {
+            "$ref": "#/components/parameters/SearchMetersParam"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Parcel features",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FeatureSetLike"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/section": {
+      "get": {
+        "summary": "Find section near coordinates",
+        "operationId": "getSection",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/LonParam"
+          },
+          {
+            "$ref": "#/components/parameters/LatParam"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Section feature(s)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FeatureOrFeatureSet"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/aliquots": {
+      "get": {
+        "summary": "Find aliquot features near coordinates",
+        "operationId": "getAliquots",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/LonParam"
+          },
+          {
+            "$ref": "#/components/parameters/LatParam"
+          },
+          {
+            "$ref": "#/components/parameters/OutSRParam"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Aliquot features",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AliquotsPayload"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/subdivision": {
+      "get": {
+        "summary": "Find subdivision near coordinates",
+        "operationId": "getSubdivision",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/LonParam"
+          },
+          {
+            "$ref": "#/components/parameters/LatParam"
+          },
+          {
+            "$ref": "#/components/parameters/OutSRParam"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Subdivision features",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FeatureSetLike"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/static-map": {
+      "get": {
+        "summary": "Get static map image for coordinates",
+        "operationId": "getStaticMap",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/LonParam"
+          },
+          {
+            "$ref": "#/components/parameters/LatParam"
+          },
+          {
+            "name": "address",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Image response",
+            "content": {
+              "image/png": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "image/jpeg": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            },
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string",
+                  "format": "uri"
+                },
+                "description": "Present when redirecting to hosted map image."
+              }
+            }
+          },
+          "302": {
+            "description": "Redirect to image"
+          }
+        }
+      }
+    },
+    "/api/utilities": {
+      "get": {
+        "summary": "Fetch utility data for an address",
+        "operationId": "getUtilities",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AddressParam"
+          },
+          {
+            "$ref": "#/components/parameters/OutSRParam"
+          },
+          {
+            "name": "sources",
+            "in": "query",
+            "description": "Comma-separated utility source keys, e.g. power,water",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Utilities grouped by source",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UtilitiesPayload"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/project-file/template": {
+      "get": {
+        "summary": "Build project-file template",
+        "operationId": "buildProjectTemplate",
+        "parameters": [
+          {
+            "name": "projectName",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "client",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/AddressParam"
+          },
+          {
+            "name": "resources",
+            "in": "query",
+            "description": "JSON-encoded array of project resources.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Template project file",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectFileTemplatePayload"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/project-file/compile": {
+      "post": {
+        "summary": "Compile project file",
+        "operationId": "compileProjectFile",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProjectCompileRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Compile result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectCompileResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid project payload"
+          }
+        }
+      }
+    },
+    "/api/fld-config": {
+      "get": {
+        "summary": "Fetch field-to-finish configuration",
+        "operationId": "getF2FConfig",
+        "parameters": [
+          {
+            "name": "file",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "FLD config",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "type": "object"
+                    },
+                    {
+                      "type": "array"
+                    }
+                  ]
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/localstorage-sync": {
+      "get": {
+        "summary": "Get localstorage sync snapshot",
+        "operationId": "getLocalStorageSync",
+        "responses": {
+          "200": {
+            "description": "Current sync state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SyncStatePayload"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Push localstorage sync snapshot",
+        "operationId": "pushLocalStorageSync",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SyncPushPayload"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Sync acknowledged",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SyncAckPayload"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Version conflict"
+          }
+        }
+      }
+    },
+    "/extract": {
+      "post": {
+        "summary": "Extract ROS/ocr content",
+        "operationId": "extractRos",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "file"
+                ],
+                "properties": {
+                  "file": {
+                    "type": "string",
+                    "format": "binary"
+                  },
+                  "options": {
+                    "type": "string",
+                    "description": "Optional JSON string with extraction options."
+                  }
+                }
+              }
+            },
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "sourceUrl"
+                ],
+                "properties": {
+                  "sourceUrl": {
+                    "type": "string",
+                    "format": "uri"
+                  },
+                  "options": {
+                    "type": "object",
+                    "additionalProperties": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Extraction output",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExtractionPayload"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/ros-pdf": {
+      "get": {
+        "summary": "Fetch ROS PDF by URL",
+        "operationId": "getRosPdf",
+        "parameters": [
+          {
+            "name": "url",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uri"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "PDF stream",
+            "content": {
+              "application/pdf": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid URL"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "AddressParam": {
+        "name": "address",
+        "in": "query",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      },
+      "LonParam": {
+        "name": "lon",
+        "in": "query",
+        "required": true,
+        "schema": {
+          "type": "number",
+          "format": "double"
+        }
+      },
+      "LatParam": {
+        "name": "lat",
+        "in": "query",
+        "required": true,
+        "schema": {
+          "type": "number",
+          "format": "double"
+        }
+      },
+      "OutSRParam": {
+        "name": "outSR",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "integer"
+        }
+      },
+      "SearchMetersParam": {
+        "name": "searchMeters",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "number",
+          "format": "double"
+        }
+      }
+    },
+    "schemas": {
+      "HealthResponse": {
+        "type": "object",
+        "required": [
+          "ok"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          }
+        }
+      },
+      "AppEntry": {
+        "type": "object",
+        "required": [
+          "entryHtml",
+          "name",
+          "iconPath"
+        ],
+        "properties": {
+          "entryHtml": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "iconPath": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "section": {
+            "type": "string"
+          },
+          "experimental": {
+            "type": "boolean"
+          },
+          "iconHeight": {
+            "type": "number"
+          },
+          "id": {
+            "type": "string"
+          }
+        }
+      },
+      "AppCatalogPayload": {
+        "type": "object",
+        "required": [
+          "apps"
+        ],
+        "properties": {
+          "apps": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AppEntry"
+            }
+          }
+        }
+      },
+      "GeoPoint": {
+        "type": "object",
+        "required": [
+          "lat",
+          "lon"
+        ],
+        "properties": {
+          "lat": {
+            "type": "number"
+          },
+          "lon": {
+            "type": "number"
+          }
+        }
+      },
+      "GeocodePayload": {
+        "$ref": "#/components/schemas/GeoPoint"
+      },
+      "FeatureLike": {
+        "type": "object",
+        "required": [
+          "attributes"
+        ],
+        "properties": {
+          "attributes": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "geometry": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "additionalProperties": true
+      },
+      "FeatureSetLike": {
+        "type": "object",
+        "properties": {
+          "features": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FeatureLike"
+            }
+          },
+          "spatialReference": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "additionalProperties": true
+      },
+      "FeatureOrFeatureSet": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/FeatureLike"
+          },
+          {
+            "$ref": "#/components/schemas/FeatureSetLike"
+          }
+        ]
+      },
+      "LookupPayload": {
+        "type": "object",
+        "required": [
+          "location",
+          "section",
+          "township"
+        ],
+        "properties": {
+          "location": {
+            "$ref": "#/components/schemas/GeoPoint"
+          },
+          "section": {
+            "$ref": "#/components/schemas/FeatureLike"
+          },
+          "township": {
+            "$ref": "#/components/schemas/FeatureLike"
+          }
+        }
+      },
+      "AliquotsPayload": {
+        "type": "object",
+        "required": [
+          "aliquots"
+        ],
+        "properties": {
+          "aliquots": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FeatureLike"
+            }
+          }
+        }
+      },
+      "UtilitiesPayload": {
+        "type": "object",
+        "properties": {
+          "address": {
+            "type": "string"
+          },
+          "sources": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "results": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "additionalProperties": true
+      },
+      "ProjectFileTemplatePayload": {
+        "type": "object",
+        "properties": {
+          "project": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "resources": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          }
+        },
+        "additionalProperties": true
+      },
+      "ProjectCompileRequest": {
+        "type": "object",
+        "properties": {
+          "projectFile": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "project": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "anyOf": [
+          {
+            "required": [
+              "projectFile"
+            ]
+          },
+          {
+            "required": [
+              "project"
+            ]
+          }
+        ]
+      },
+      "ProjectCompileResult": {
+        "type": "object",
+        "properties": {
+          "artifacts": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "url": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": true
+            }
+          },
+          "logs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "errors": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": true
+      },
+      "SyncStatePayload": {
+        "type": "object",
+        "required": [
+          "version",
+          "snapshot"
+        ],
+        "properties": {
+          "version": {
+            "type": "integer"
+          },
+          "snapshot": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "additionalProperties": true
+      },
+      "SyncPushPayload": {
+        "$ref": "#/components/schemas/SyncStatePayload"
+      },
+      "SyncAckPayload": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "version": {
+            "type": "integer"
+          },
+          "conflict": {
+            "type": "boolean"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      },
+      "ExtractionEntity": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          },
+          "confidence": {
+            "type": "number"
+          },
+          "bbox": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            }
+          }
+        },
+        "additionalProperties": true
+      },
+      "ExtractionPayload": {
+        "type": "object",
+        "properties": {
+          "entities": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ExtractionEntity"
+            }
+          },
+          "artifacts": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          },
+          "meta": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "additionalProperties": true
+      }
+    }
+  }
+}

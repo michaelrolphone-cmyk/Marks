@@ -118,6 +118,33 @@ Reference inventory of expected/observed external API and WebSocket endpoints. T
 
 ---
 
+
+## HTTP API documentation
+
+The canonical OpenAPI specification is in `docs/openapi.json`.
+
+Covered HTTP endpoints:
+
+- `GET /health`
+- `GET /api/apps`
+- `GET /api/geocode`
+- `GET /api/lookup`
+- `GET /api/parcel`
+- `GET /api/section`
+- `GET /api/aliquots`
+- `GET /api/subdivision`
+- `GET /api/static-map`
+- `GET /api/utilities`
+- `GET /api/project-file/template`
+- `POST /api/project-file/compile`
+- `GET /api/fld-config`
+- `GET /api/localstorage-sync`
+- `POST /api/localstorage-sync`
+- `POST /extract`
+- `GET /api/ros-pdf`
+
+The OpenAPI spec includes request parameters, request bodies, and response schemas for each route so it can be used directly by tooling.
+
 ## CLI usage
 
 ## Prerequisites
