@@ -26,6 +26,7 @@ import json
 import os
 import queue
 import re
+import socket
 import sys
 import threading
 import time
@@ -887,6 +888,30 @@ def extract_verify_pair(user_request: str) -> Tuple[Optional[str], Optional[str]
     return None, None
 
 
+def extract_user_request_from_messages(messages: List[Dict[str, Any]]) -> str:
+    """Best-effort conversion of chat messages into a single user request."""
+    for message in reversed(messages or []):
+        if str(message.get("role", "")).lower() != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+        if isinstance(content, list):
+            chunks: List[str] = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
+                    chunks.append(part["text"].strip())
+            merged = "\n".join([c for c in chunks if c]).strip()
+            if merged:
+                return merged
+
+    if messages:
+        fallback = messages[-1].get("content")
+        if isinstance(fallback, str) and fallback.strip():
+            return fallback.strip()
+    return ""
+
+
 # ---------------------------
 # Tool formatting + classification
 # ---------------------------
@@ -1329,55 +1354,10 @@ def run_phase(
 
 
 # ---------------------------
-# main
+# runtime helpers
 # ---------------------------
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description="Marks — tool-calling agent for HTTP + WS specs + local Gmailwrap (LM Studio)")
-    ap.add_argument("request", type=str, help="User request")
-    ap.add_argument("specs", nargs="+", help="One or more JSON spec files (HTTP and/or WS)")
-
-    ap.add_argument("--stream", action="store_true", help="Stream assistant text to CLI (if supported)")
-    ap.add_argument("--trace", action="store_true", help="Verbose tool call logging (args + results)")
-    ap.add_argument("--no-debug", action="store_true", help="Suppress tool action summaries")
-
-    ap.add_argument("--llm-base-url", default=os.environ.get("LMSTUDIO_BASE_URL", "http://localhost:1234/v1"))
-    ap.add_argument("--llm-key", default=os.environ.get("OPENAI_API_KEY", "lm_studio"))
-    ap.add_argument("--model", default=os.environ.get("LMSTUDIO_MODEL", "local-model"))
-    ap.add_argument("--llm-timeout", type=int, default=int(os.environ.get("LMSTUDIO_TIMEOUT", "240")))
-    ap.add_argument("--llm-retries", type=int, default=int(os.environ.get("LMSTUDIO_RETRIES", "1")))
-
-    ap.add_argument("--http-base-url", default=os.environ.get("MARKS_HTTP_BASE_URL", ""),
-                    help="Override HTTP base URL for ALL HTTP specs")
-    ap.add_argument("--ws-base-url", default=os.environ.get("MARKS_WS_BASE_URL", ""),
-                    help="Override WS base URL for ALL WS specs")
-
-    ap.add_argument("--bearer", default=os.environ.get("MARKS_BEARER", ""),
-                    help="Authorization bearer token (adds Authorization: Bearer <token>)")
-    ap.add_argument("--header", action="append", default=[],
-                    help='Extra header, repeatable. Example: --header "x-control-token: abc"')
-
-    ap.add_argument("--resolve-steps", type=int, default=8, help="Max steps for RESOLVE phase")
-    ap.add_argument("--execute-steps", type=int, default=20, help="Max steps for EXECUTE phase")
-    ap.add_argument("--no-write-guard", action="store_true", help="Disable 'must have successful write' gate")
-    ap.add_argument("--no-verify-guard", action="store_true", help="Disable 'must verify by read-back' gate")
-
-    # Local Gmailwrap + action gate
-    ap.add_argument("--gmailwrap", default=os.environ.get("MARKS_GMAILWRAP", ""),
-                    help="Path to gmailwrap.mjs (Node script). Enables gmail_list/gmail_read/gmail_send tools.")
-    ap.add_argument("--gate", default=os.environ.get("MARKS_GATE", ""),
-                    help="Unlock modifying/deleting/emailing actions. Use: --gate ALLOW")
-
-    args = ap.parse_args()
-
-    debug = not args.no_debug
-    trace = bool(args.trace)
-
-    # Action gate: ON by default; unlocked only with ALLOW
-    action_gate_on = True
-    action_gate_unlocked = (str(args.gate).strip().upper() == "ALLOW")
-    log("policy", f"action_gate=on unlocked={action_gate_unlocked}", True)
-
+def build_runtime(args: argparse.Namespace, debug: bool) -> Tuple[OpenAICompat, WSManager, List[ToolDef], Dict[str, str]]:
     default_headers: Dict[str, str] = {}
     if args.bearer:
         default_headers["Authorization"] = f"Bearer {args.bearer}"
@@ -1448,7 +1428,19 @@ def main() -> None:
         log("init", f"Local Gmail tools loaded from {args.gmailwrap}", True)
 
     log("init", f"Total tools loaded: {len(all_tools)} from {len(args.specs)} spec file(s)", True)
+    return client, ws_manager, all_tools, default_headers
 
+
+def execute_agent_request(
+    user_request: str,
+    args: argparse.Namespace,
+    client: OpenAICompat,
+    all_tools: List[ToolDef],
+    debug: bool,
+    trace: bool,
+    action_gate_on: bool,
+    action_gate_unlocked: bool,
+) -> str:
     uniq_names = []
     seen = set()
     for t in all_tools:
@@ -1457,7 +1449,6 @@ def main() -> None:
             uniq_names.append(t.name)
     tool_index = "\n".join(f"- {n}" for n in uniq_names)
 
-    user_request = args.request
     write_req = is_write_request(user_request)
     update_intent = is_update_intent(user_request)
     verify_field, verify_value = extract_verify_pair(user_request)
@@ -1467,7 +1458,6 @@ def main() -> None:
     lookup_evidence = {"has_read_ok": False, "last_read": None, "resolved_target": None}
     track_write = {"did_write": False, "write_ok": False, "did_verify_read": False, "verified_match": False, "verification_read": None}
 
-    # RESOLVE (read-only)
     messages: List[Dict[str, Any]] = [
         {"role": "system", "content": make_system_prompt("RESOLVE", tool_index)},
         {"role": "user", "content": user_request},
@@ -1493,7 +1483,6 @@ def main() -> None:
         user_update_intent=update_intent,
     )
 
-    # Inject resolved target hint (generic, only if we actually found one)
     if lookup_evidence.get("resolved_target"):
         t = lookup_evidence["resolved_target"]
         messages.append({
@@ -1505,12 +1494,7 @@ def main() -> None:
             )
         })
 
-    # EXECUTE (writes allowed with guards)
-    messages = [
-        {"role": "system", "content": make_system_prompt("EXECUTE", tool_index)},
-        *messages[1:],
-    ]
-
+    messages = [{"role": "system", "content": make_system_prompt("EXECUTE", tool_index)}, *messages[1:]]
     require_lookup = (write_req and update_intent)
 
     run_phase(
@@ -1532,13 +1516,10 @@ def main() -> None:
         user_update_intent=update_intent,
     )
 
-    # Final answer step + hard gates
     if write_req and not args.no_write_guard and not track_write.get("write_ok"):
         messages.append({"role": "user", "content": "You have not completed a confirmed successful write. Use tools to do the write, then verify by reading back (or for email, ensure send succeeded)."})
-
     if write_req and not args.no_verify_guard and not track_write.get("verified_match"):
         messages.append({"role": "user", "content": "You must verify the change by reading back and confirming it. Then provide the final result."})
-
     messages.append({"role": "user", "content": "Now provide the final user-facing answer. Do not mention tool names, planning, or internal rules."})
 
     resp = client.chat_completions(
@@ -1555,13 +1536,208 @@ def main() -> None:
     final = clean_model_text(msg.get("content") or "")
 
     if write_req and not args.no_write_guard and not track_write.get("write_ok"):
-        final = "I could not complete the requested action because no confirmed successful write occurred via tools."
-    elif write_req and not args.no_verify_guard and not track_write.get("verified_match"):
-        final = "A write may have been attempted, but I could not verify the result successfully."
+        return "I could not complete the requested action because no confirmed successful write occurred via tools."
+    if write_req and not args.no_verify_guard and not track_write.get("verified_match"):
+        return "A write may have been attempted, but I could not verify the result successfully."
+    return final if final else "Done."
+
+
+def run_control_ws_loop(
+    args: argparse.Namespace,
+    client: OpenAICompat,
+    all_tools: List[ToolDef],
+    debug: bool,
+    trace: bool,
+    action_gate_on: bool,
+    action_gate_unlocked: bool,
+) -> None:
+    ws_url = args.control_ws_url
+    token = args.control_token
+    client_id = args.client_id or f"{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
+    inflight_cancel: Dict[str, threading.Event] = {}
+    send_lock = threading.Lock()
+
+    wsapp_ref: Dict[str, Optional[websocket.WebSocketApp]] = {"ws": None}
+
+    def send_obj(obj: Dict[str, Any]) -> None:
+        wsapp = wsapp_ref["ws"]
+        if not wsapp:
+            return
+        with send_lock:
+            try:
+                wsapp.send(json.dumps(obj, ensure_ascii=False))
+            except Exception:
+                return
+
+    def on_open(wsapp: websocket.WebSocketApp) -> None:
+        send_obj({
+            "type": "hello",
+            "client_id": client_id,
+            "lm_base_url": args.llm_base_url,
+            "capabilities": {
+                "models": True,
+                "chat": True,
+                "stream": False,
+                "cancel": True,
+                "tools": True,
+            },
+            "ts": int(time.time() * 1000),
+        })
+
+    def run_chat(msg_id: str, body: Dict[str, Any]) -> None:
+        cancel_evt = inflight_cancel[msg_id]
+        messages = body.get("messages") if isinstance(body, dict) else None
+        user_request = extract_user_request_from_messages(messages if isinstance(messages, list) else [])
+        if not user_request:
+            send_obj({"type": "error", "id": msg_id, "error": {"message": "chat missing body.messages[]"}})
+            inflight_cancel.pop(msg_id, None)
+            return
+
+        try:
+            result = execute_agent_request(user_request, args, client, all_tools, debug, trace, action_gate_on, action_gate_unlocked)
+            if cancel_evt.is_set():
+                send_obj({"type": "cancelled", "id": msg_id, "ok": True})
+            else:
+                send_obj({"type": "done", "id": msg_id, "message": result, "finish_reason": "stop", "usage": None})
+        except Exception as e:
+            send_obj({"type": "error", "id": msg_id, "error": {"message": str(e)}})
+        finally:
+            inflight_cancel.pop(msg_id, None)
+
+    def on_message(_wsapp: websocket.WebSocketApp, raw: str) -> None:
+        try:
+            msg = json.loads(raw)
+        except Exception:
+            send_obj({"type": "error", "id": None, "error": {"message": "bad_json"}})
+            return
+
+        mtype = str(msg.get("type") or "")
+        msg_id = str(msg.get("id") or "")
+
+        if mtype == "ping":
+            send_obj({"type": "pong", "ts": int(time.time() * 1000)})
+            return
+        if mtype == "pong":
+            return
+        if mtype == "models":
+            try:
+                send_obj({"type": "models", "id": msg_id, "ok": True, "data": {"data": [{"id": client.model}]}})
+            except Exception as e:
+                send_obj({"type": "models", "id": msg_id, "ok": False, "error": {"message": str(e)}})
+            return
+        if mtype == "cancel":
+            evt = inflight_cancel.get(msg_id)
+            if evt:
+                evt.set()
+                send_obj({"type": "cancelled", "id": msg_id, "ok": True})
+            else:
+                send_obj({"type": "cancelled", "id": msg_id, "ok": False, "error": {"message": "not_inflight"}})
+            return
+        if mtype == "chat":
+            body = msg.get("body")
+            if not isinstance(body, dict):
+                send_obj({"type": "error", "id": msg_id, "error": {"message": "chat missing body.messages[]"}})
+                return
+            send_obj({"type": "started", "id": msg_id})
+            inflight_cancel[msg_id] = threading.Event()
+            threading.Thread(target=run_chat, args=(msg_id, body), daemon=True).start()
+            return
+
+        send_obj({"type": "error", "id": msg_id or None, "error": {"message": f"unknown_type:{mtype}"}})
+
+    headers = [f"x-control-token: {token}"] if token else None
+    backoff_s = 1.0
+    while True:
+        log("ws", f"Connecting to control WS: {ws_url}", True)
+        wsapp = websocket.WebSocketApp(
+            ws_url,
+            header=headers,
+            on_open=on_open,
+            on_message=on_message,
+        )
+        wsapp_ref["ws"] = wsapp
+        wsapp.run_forever(ping_interval=25)
+        time.sleep(backoff_s)
+        backoff_s = min(30.0, backoff_s * 1.6)
+
+
+# ---------------------------
+# main
+# ---------------------------
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Marks — tool-calling agent for HTTP + WS specs + local Gmailwrap (LM Studio)")
+    ap.add_argument("request", nargs="?", default="", help="User request (required unless --control-ws-url is used)")
+    ap.add_argument("specs", nargs="*", help="One or more JSON spec files (HTTP and/or WS)")
+
+    ap.add_argument("--stream", action="store_true", help="Stream assistant text to CLI (if supported)")
+    ap.add_argument("--trace", action="store_true", help="Verbose tool call logging (args + results)")
+    ap.add_argument("--no-debug", action="store_true", help="Suppress tool action summaries")
+
+    ap.add_argument("--llm-base-url", default=os.environ.get("LMSTUDIO_BASE_URL", "http://localhost:1234/v1"))
+    ap.add_argument("--llm-key", default=os.environ.get("OPENAI_API_KEY", "lm_studio"))
+    ap.add_argument("--model", default=os.environ.get("LMSTUDIO_MODEL", "local-model"))
+    ap.add_argument("--llm-timeout", type=int, default=int(os.environ.get("LMSTUDIO_TIMEOUT", "240")))
+    ap.add_argument("--llm-retries", type=int, default=int(os.environ.get("LMSTUDIO_RETRIES", "1")))
+
+    ap.add_argument("--http-base-url", default=os.environ.get("MARKS_HTTP_BASE_URL", ""),
+                    help="Override HTTP base URL for ALL HTTP specs")
+    ap.add_argument("--ws-base-url", default=os.environ.get("MARKS_WS_BASE_URL", ""),
+                    help="Override WS base URL for ALL WS specs")
+
+    ap.add_argument("--bearer", default=os.environ.get("MARKS_BEARER", ""),
+                    help="Authorization bearer token (adds Authorization: Bearer <token>)")
+    ap.add_argument("--header", action="append", default=[],
+                    help='Extra header, repeatable. Example: --header "x-control-token: abc"')
+
+    ap.add_argument("--resolve-steps", type=int, default=8, help="Max steps for RESOLVE phase")
+    ap.add_argument("--execute-steps", type=int, default=20, help="Max steps for EXECUTE phase")
+    ap.add_argument("--no-write-guard", action="store_true", help="Disable 'must have successful write' gate")
+    ap.add_argument("--no-verify-guard", action="store_true", help="Disable 'must verify by read-back' gate")
+
+    ap.add_argument("--gmailwrap", default=os.environ.get("MARKS_GMAILWRAP", ""),
+                    help="Path to gmailwrap.mjs (Node script). Enables gmail_list/gmail_read/gmail_send tools.")
+    ap.add_argument("--gate", default=os.environ.get("MARKS_GATE", ""),
+                    help="Unlock modifying/deleting/emailing actions. Use: --gate ALLOW")
+
+    ap.add_argument("--control-ws-url", default=os.environ.get("CONTROL_WS_URL", ""),
+                    help="Control WebSocket endpoint compatible with lmstudio-proxy-client protocol")
+    ap.add_argument("--control-token", default=os.environ.get("CONTROL_TOKEN", ""),
+                    help="Optional x-control-token header for --control-ws-url")
+    ap.add_argument("--client-id", default=os.environ.get("CLIENT_ID", ""),
+                    help="Optional identity sent in control WS hello")
+
+    args = ap.parse_args()
+
+    if args.control_ws_url and (not args.specs) and args.request:
+        args.specs = [args.request]
+        args.request = ""
+
+    if not args.specs:
+        raise ValueError("At least one spec file is required.")
+
+    debug = not args.no_debug
+    trace = bool(args.trace)
+
+    action_gate_on = True
+    action_gate_unlocked = (str(args.gate).strip().upper() == "ALLOW")
+    log("policy", f"action_gate=on unlocked={action_gate_unlocked}", True)
+
+    client, _ws_manager, all_tools, _headers = build_runtime(args, debug)
+
+    if args.control_ws_url:
+        run_control_ws_loop(args, client, all_tools, debug, trace, action_gate_on, action_gate_unlocked)
+        return
+
+    if not args.request.strip():
+        raise ValueError("request is required unless --control-ws-url is used")
+
+    final = execute_agent_request(args.request, args, client, all_tools, debug, trace, action_gate_on, action_gate_unlocked)
 
     print("\n" + "=" * 60)
-    print(final if final else "Done.")
+    print(final)
     print("=" * 60 + "\n")
+
 
 
 if __name__ == "__main__":
@@ -1573,4 +1749,3 @@ if __name__ == "__main__":
     except Exception as e:
         eprint(f"Fatal error: {e}")
         sys.exit(1)
-
