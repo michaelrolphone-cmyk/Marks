@@ -365,3 +365,8 @@ Server -> client messages (launcher-derived schema):
 “HUMAN READABLE” NOTE (server-related dependency)
 If you only have crewMemberId UUIDs, fetch crew list from your crew API endpoint (commonly GET /api/crew) and map IDs to names.
 (Endpoint not present in this launcher file; include it in the server catalog if it exists.)
+
+21. WS /ws/lmproxy (or CONTROL_WS_URL equivalent)
+    Purpose: remote control channel used by both lmstudio-proxy-client.js and marks.py control mode.
+    Inbound types: ping, pong, models, chat, cancel.
+    Outbound types: hello, started, delta (proxy client), done, models, cancelled, error, ping, pong.

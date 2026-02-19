@@ -49,9 +49,11 @@ When enabled with `--gmailwrap <path>`, the CLI exposes:
 
 `gmail_send` adds a request-id marker and attempts to verify the message in Sent folders to reduce accidental duplicate sends.
 
-### 5) Remote control LM Studio proxy client
+### 5) Remote control WebSocket clients (LM proxy + Marks tools agent)
 
 `lmstudio-proxy-client.js` connects to a server-side WebSocket channel and proxies model listing + chat completions (including streaming deltas/cancel support) to a local LM Studio API.
+
+`marks.py` can also connect to the same control channel (`--control-ws-url`) and answer `chat` messages by running the Marks tool-enabled workflow (resolve/execute/verify + HTTP/WS/Gmail tools).
 
 ---
 
@@ -132,6 +134,8 @@ Reference inventory of expected/observed external API and WebSocket endpoints. T
 
 ```bash
 python3 marks.py "<request>" <spec1.json> [spec2.json ...] [options]
+# control WS mode (same protocol as lmstudio-proxy-client.js)
+python3 marks.py <spec1.json> [spec2.json ...] --control-ws-url wss://server/ws/lmproxy
 ```
 
 ### Core options
@@ -163,6 +167,12 @@ python3 marks.py "<request>" <spec1.json> [spec2.json ...] [options]
 
 - `--gmailwrap <path>` (or `MARKS_GMAILWRAP`) to enable Gmail tools
 - `--gate ALLOW` (or `MARKS_GATE=ALLOW`) to unlock write/send actions
+
+### Control WebSocket mode (`marks.py`)
+
+- `--control-ws-url` (or `CONTROL_WS_URL`) connect to lmstudio-proxy-client compatible control channel
+- `--control-token` (or `CONTROL_TOKEN`) sends `x-control-token` header
+- `--client-id` (or `CLIENT_ID`) override hello identity
 
 ## Gmail wrapper CLI (`gmailwrap.mjs`)
 
@@ -213,7 +223,7 @@ Used by `marks.py` and/or `lmstudio-proxy-client.js`:
 
 ## Control WebSocket endpoint
 
-Used by `lmstudio-proxy-client.js`:
+Used by `lmstudio-proxy-client.js` and optional control mode in `marks.py`:
 
 - `WS <CONTROL_WS_URL>`
 
