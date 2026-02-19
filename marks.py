@@ -23,6 +23,7 @@ Additions in this version:
 
 import argparse
 import json
+import math
 import os
 import queue
 import re
@@ -91,16 +92,20 @@ class OpenAICompat:
         base_url: str,
         api_key: str,
         model: str,
-        timeout_s: int = 180,
+        timeout_s: int = 0,
         retries: int = 1,
         retry_backoff_s: float = 0.8,
+        timeout_backoff_factor: float = 1.5,
+        max_timeout_s: int = 900,
     ):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
-        self.timeout_s = timeout_s
+        self.timeout_s = None if int(timeout_s) <= 0 else int(timeout_s)
         self.retries = retries
         self.retry_backoff_s = retry_backoff_s
+        self.timeout_backoff_factor = max(1.0, float(timeout_backoff_factor))
+        self.max_timeout_s = max(1, int(max_timeout_s))
 
     def _headers(self) -> Dict[str, str]:
         return {
@@ -110,7 +115,7 @@ class OpenAICompat:
 
     def list_models(self) -> List[str]:
         url = f"{self.base_url}/models"
-        r = requests.get(url, headers=self._headers(), timeout=15)
+        r = requests.get(url, headers=self._headers(), timeout=self.timeout_s)
         r.raise_for_status()
         j = r.json()
         data = j.get("data") or []
@@ -169,15 +174,16 @@ class OpenAICompat:
             payload["function_call"] = "auto"
 
         attempt = 0
+        req_timeout_s = None if self.timeout_s is None else max(1, int(self.timeout_s))
         while attempt <= self.retries:
             attempt += 1
             try:
                 if not stream:
-                    r = requests.post(url, headers=self._headers(), json=payload, timeout=self.timeout_s)
+                    r = requests.post(url, headers=self._headers(), json=payload, timeout=req_timeout_s)
                     r.raise_for_status()
                     return r.json()
 
-                r = requests.post(url, headers=self._headers(), json=payload, timeout=self.timeout_s, stream=True)
+                r = requests.post(url, headers=self._headers(), json=payload, timeout=req_timeout_s, stream=True)
                 r.raise_for_status()
 
                 assembled_content = ""
@@ -249,7 +255,12 @@ class OpenAICompat:
                 transient = ("timed out" in s) or ("connection" in s) or ("reset" in s) or ("temporarily" in s)
                 if attempt <= self.retries and transient:
                     backoff = self.retry_backoff_s * (2 ** (attempt - 1))
-                    log("llm", f"LLM error: {e}. Retrying after {backoff:.2f}s", True)
+                    if req_timeout_s is None:
+                        log("llm", f"LLM error: {e}. Retrying after {backoff:.2f}s (timeout=disabled)", True)
+                    else:
+                        next_timeout_s = min(self.max_timeout_s, int(math.ceil(req_timeout_s * self.timeout_backoff_factor)))
+                        log("llm", f"LLM error: {e}. Retrying after {backoff:.2f}s (timeout {req_timeout_s}s -> {next_timeout_s}s)", True)
+                        req_timeout_s = next_timeout_s
                     time.sleep(backoff)
                     continue
                 raise
@@ -1449,9 +1460,10 @@ def build_runtime(args: argparse.Namespace, debug: bool) -> Tuple[OpenAICompat, 
         base_url=args.llm_base_url,
         api_key=args.llm_key,
         model=args.model,
-        timeout_s=max(10, int(args.llm_timeout)),
+        timeout_s=int(args.llm_timeout),
         retries=max(0, int(args.llm_retries)),
         retry_backoff_s=0.8,
+        max_timeout_s=max(10, int(args.llm_max_timeout)),
     )
     client.model = client.choose_model(client.model)
 
@@ -1758,8 +1770,11 @@ def main() -> None:
     ap.add_argument("--llm-base-url", default=os.environ.get("LMSTUDIO_BASE_URL", "http://localhost:1234/v1"))
     ap.add_argument("--llm-key", default=os.environ.get("OPENAI_API_KEY", "lm_studio"))
     ap.add_argument("--model", default=os.environ.get("LMSTUDIO_MODEL", "local-model"))
-    ap.add_argument("--llm-timeout", type=int, default=int(os.environ.get("LMSTUDIO_TIMEOUT", "240")))
-    ap.add_argument("--llm-retries", type=int, default=int(os.environ.get("LMSTUDIO_RETRIES", "1")))
+    ap.add_argument("--llm-timeout", type=int, default=int(os.environ.get("LMSTUDIO_TIMEOUT", "0")),
+                    help="LLM request timeout in seconds. Use 0 to disable timeout.")
+    ap.add_argument("--llm-retries", type=int, default=int(os.environ.get("LMSTUDIO_RETRIES", "2")))
+    ap.add_argument("--llm-max-timeout", type=int, default=int(os.environ.get("LMSTUDIO_MAX_TIMEOUT", "900")),
+                    help="Upper bound for adaptive LLM timeout growth across retries (used only when --llm-timeout > 0)")
 
     ap.add_argument("--http-base-url", default=os.environ.get("MARKS_HTTP_BASE_URL", ""),
                     help="Override HTTP base URL for ALL HTTP specs")

@@ -189,8 +189,9 @@ python3 marks.py <spec1.json> [spec2.json ...] --control-ws-url wss://server/ws/
 - `--llm-base-url` (default `LMSTUDIO_BASE_URL` or `http://localhost:1234/v1`)
 - `--llm-key` (default `OPENAI_API_KEY` or `lm_studio`)
 - `--model` (default `LMSTUDIO_MODEL` or `local-model`)
-- `--llm-timeout` (default `LMSTUDIO_TIMEOUT` or `240`)
-- `--llm-retries` (default `LMSTUDIO_RETRIES` or `1`)
+- `--llm-timeout` (default `LMSTUDIO_TIMEOUT` or `0`; set to `0` for no timeout)
+- `--llm-retries` (default `LMSTUDIO_RETRIES` or `2`)
+- `--llm-max-timeout` (default `LMSTUDIO_MAX_TIMEOUT` or `900`) cap for adaptive timeout growth after transient connection/read timeout errors when `--llm-timeout > 0`
 
 ### Spec transport overrides
 
