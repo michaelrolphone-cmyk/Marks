@@ -55,6 +55,15 @@ When enabled with `--gmailwrap <path>`, the CLI exposes:
 
 `marks.py` can also connect to the same control channel (`--control-ws-url`) and answer `chat` messages by running the Marks tool-enabled workflow (resolve/execute/verify + HTTP/WS/Gmail tools).
 
+### 6) Conversational proxy mode when tools are not needed
+
+Before running tool orchestration, `marks.py` now classifies each request as either:
+
+- **NEEDS_TOOLS**: requests that require system actions or live data from APIs/WS/Gmail
+- **CONVERSATIONAL**: normal chat, explanations, brainstorming, or general Q&A
+
+When classified as conversational, Marks bypasses RESOLVE/EXECUTE tool phases and directly proxies the request to the configured LLM.
+
 ---
 
 ## Module-by-module guide
