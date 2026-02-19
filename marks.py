@@ -912,6 +912,82 @@ def extract_user_request_from_messages(messages: List[Dict[str, Any]]) -> str:
     return ""
 
 
+def should_use_tools_for_request(
+    user_request: str,
+    client: OpenAICompat,
+    all_tools: List[ToolDef],
+    stream: bool,
+) -> bool:
+    """
+    Decide whether a request should run through tool orchestration or be answered
+    directly as a normal conversational turn.
+
+    Returns True when tools are needed; False for plain conversational requests.
+    """
+    text = (user_request or "").strip()
+    if not text:
+        return False
+
+    # Fast path for obvious action requests.
+    lowered = text.lower()
+    action_patterns = (
+        r"\b(get|fetch|find|lookup|search|check|show|list|read)\b",
+        r"\b(create|add|set|update|change|modify|delete|remove|send|email|notify)\b",
+        r"\b(api|endpoint|websocket|ws|gmail|inbox|message id|record|database|system)\b",
+    )
+    if any(re.search(p, lowered) for p in action_patterns):
+        return True
+
+    tool_names = ", ".join(sorted({t.name for t in all_tools}))
+    classifier_prompt = (
+        "You are a strict router for a tool-using assistant.\n"
+        "Return exactly one token: NEEDS_TOOLS or CONVERSATIONAL.\n"
+        "Choose NEEDS_TOOLS only if the user asks for real-world actions or system-specific data that requires tools.\n"
+        "Choose CONVERSATIONAL for chit-chat, explanations, brainstorming, writing help, or general knowledge.\n"
+        f"Available tools: {tool_names}"
+    )
+
+    resp = client.chat_completions(
+        messages=[
+            {"role": "system", "content": classifier_prompt},
+            {"role": "user", "content": text},
+        ],
+        tools=None,
+        functions=None,
+        max_tokens=8,
+        stream=stream,
+    )
+    msg = (resp.get("choices") or [{}])[0].get("message") or {}
+    content = clean_model_text(msg.get("content") or "").upper()
+    return "NEEDS_TOOLS" in content
+
+
+def answer_conversational_request(user_request: str, client: OpenAICompat, stream: bool) -> str:
+    """Proxy conversational requests directly to the LLM without tools."""
+    resp = client.chat_completions(
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are Marks in conversational proxy mode. "
+                    "Answer the user directly and clearly."
+                ),
+            },
+            {"role": "user", "content": user_request},
+        ],
+        tools=None,
+        functions=None,
+        max_tokens=600,
+        stream=stream,
+    )
+    if stream:
+        print("")
+
+    msg = (resp.get("choices") or [{}])[0].get("message") or {}
+    final = clean_model_text(msg.get("content") or "")
+    return final if final else "Done."
+
+
 # ---------------------------
 # Tool formatting + classification
 # ---------------------------
@@ -1441,6 +1517,11 @@ def execute_agent_request(
     action_gate_on: bool,
     action_gate_unlocked: bool,
 ) -> str:
+    if not should_use_tools_for_request(user_request, client, all_tools, bool(args.stream)):
+        if debug:
+            log("policy", "Request classified as conversational; responding without tools.", True)
+        return answer_conversational_request(user_request, client, bool(args.stream))
+
     uniq_names = []
     seen = set()
     for t in all_tools:
