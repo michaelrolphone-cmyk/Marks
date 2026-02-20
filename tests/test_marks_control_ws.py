@@ -29,8 +29,11 @@ class FakeClient:
         self.responses = list(responses)
         self.calls = []
 
-    def chat_completions(self, **kwargs):
-        self.calls.append(kwargs)
+    def chat_completions(self, *args, **kwargs):
+        call = dict(kwargs)
+        if args:
+            call["_args"] = list(args)
+        self.calls.append(call)
         if not self.responses:
             raise AssertionError("No more fake responses configured")
         return self.responses.pop(0)
@@ -98,6 +101,29 @@ class ToolRoutingTests(unittest.TestCase):
             {"choices": [{"message": {"content": ""}}]},
         ])
         self.assertEqual(answer_conversational_request("Hi", client, False), "Done.")
+
+    def test_execute_agent_request_rejects_fabricated_read_without_tool_evidence(self):
+        client = FakeClient([
+            {"choices": [{"message": {"content": "NEEDS_TOOLS"}}]},
+            {"choices": [{"message": {"content": "RESOLVE_COMPLETE"}}]},
+            {"choices": [{"message": {"content": "I looked it up and it's all set."}}]},
+            {"choices": [{"message": {"content": "Done; completed successfully."}}]},
+        ])
+        args = Namespace(
+            stream=False,
+            resolve_steps=1,
+            execute_steps=1,
+            no_write_guard=False,
+            no_verify_guard=False,
+        )
+        tools = [ToolDef(name="sample__GET__thing", description="", parameters={}, fn=lambda _: {"ok": True})]
+
+        out = execute_agent_request("Check order status", args, client, tools, debug=False, trace=False, action_gate_on=True, action_gate_unlocked=False)
+
+        self.assertEqual(
+            out,
+            "I could not complete this request because no successful read was performed via tools.",
+        )
 
 
 if __name__ == "__main__":

@@ -31,6 +31,8 @@ For each request, the agent runs a phased flow:
 
 For update-like requests, the workflow attempts to resolve a specific target entity first and enforces write/verify guardrails unless disabled by flags.
 
+For read-only tool-routed requests, Marks now returns a failure message instead of a success claim when no successful read tool execution occurred.
+
 ### 3) Action gate for risky operations
 
 Write-like operations are blocked by default (HTTP mutation methods, WebSocket sends, and Gmail send) unless the operator explicitly passes:
