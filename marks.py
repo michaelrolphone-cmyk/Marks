@@ -1628,6 +1628,11 @@ def execute_agent_request(
     msg = (resp.get("choices") or [{}])[0].get("message") or {}
     final = clean_model_text(msg.get("content") or "")
 
+    # Never allow tool-mode answers to claim completed work without any
+    # successful tool evidence.
+    if not write_req and not lookup_evidence.get("has_read_ok"):
+        return "I could not complete this request because no successful read was performed via tools."
+
     if write_req and not args.no_write_guard and not track_write.get("write_ok"):
         return "I could not complete the requested action because no confirmed successful write occurred via tools."
     if write_req and not args.no_verify_guard and not track_write.get("verified_match"):
